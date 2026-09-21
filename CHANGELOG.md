@@ -6,6 +6,19 @@ El formato se basa en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/
 
 ---
 
+## [v4.5.2] — 2026-09-21
+
+### Añadido
+- **Latido Periódico de Estado (`telemetry/state`)**: Emisión de heartbeat cada 300 s con QoS 1 y `retain=True`, preservando el timestamp de inicio de la sesión activa (`last_state_change`) para mitigar desincronizaciones por LWT.
+- **Suite de Pruebas de Integración**: 3 nuevos tests unitarios en `test_mqtt_coordinator_integration.py` validando el ciclo de vida del estado de conexión y heartbeat (10/10 tests aprobados).
+- Documentación de arquitectura: [ADR-023](docs/adr/023_heartbeat_periodico_telemetria_state_y_resiliencia_lwt.md) y diagnóstico de reconexión MQTT.
+
+### Corregido
+- **Condición de Carrera con LWT en Broker**: Priorización de publicación de estado `online` de forma inmediata en `on_connect()` antes de procesar suscripciones de tópicos.
+- **Rastreo de Estado de Conexión**: Actualización determinista de flag `is_connected` en `on_connect()` y `on_disconnect()` para evitar publicaciones erróneas con socket caído.
+
+---
+
 ## [v4.5.1] — 2026-09-03
 
 ### Añadido
