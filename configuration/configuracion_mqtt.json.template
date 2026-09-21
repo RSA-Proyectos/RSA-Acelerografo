@@ -7,6 +7,8 @@
         "telemetry_state": "{org}/{app}/{cap}/{id}/telemetry/state",
         "telemetry_health": "{org}/{app}/{cap}/{id}/telemetry/health",
         "status_acquisition": "{org}/{app}/{cap}/{id}/status/acquisition",
+        "status_sensor": "{org}/{app}/{cap}/{id}/status/sensor",
+        "status_drive": "{org}/{app}/{cap}/{id}/status/drive",
         "events_heartbeat": "{org}/{app}/{cap}/{id}/events/heartbeat",
         "events_local": "{org}/{app}/{cap}/{id}/events/detected",
         "events_regional": "{org}/{app}/{cap}/+/events/detected",
@@ -31,7 +33,9 @@
     "retain": {
         "telemetry_state": true,
         "telemetry_health": false,
-        "status_acquisition": false,
+        "status_acquisition": true,
+        "status_sensor": true,
+        "status_drive": true,
         "events_local": false,
         "cmd_response": false
     }

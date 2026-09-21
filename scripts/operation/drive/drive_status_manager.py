@@ -286,47 +286,74 @@ def limpiar_archivos_inexistentes(log_directory, directorios_por_tipo, logger=No
         directorios_por_tipo: Dict con mapeo tipo -> ruta_directorio
             Ej: {"mseed": "/ruta/mseed", "continuous": "/ruta/dat"}
         logger: Logger opcional para registrar la operación
+
+    Returns:
+        dict: Métricas de archivos removidos por tipo y totales
     """
     with _file_lock:
         data = _leer_json(log_directory)
         archivos_removidos_exitosos = 0
         archivos_removidos_fallidos = 0
+        por_tipo = {}
 
         for tipo, directorio in directorios_por_tipo.items():
             if tipo not in TIPOS_ARCHIVO:
                 continue
 
+            # Validación de seguridad: el directorio debe estar definido y existir físicamente
+            if not directorio or not os.path.isdir(directorio):
+                if logger:
+                    logger.warning(f"Directorio omitido en limpieza (no existe o inválido): '{directorio}' para tipo '{tipo}'")
+                continue
+
+            removidos_tipo_exitosos = 0
+            removidos_tipo_fallidos = 0
+
             # Limpiar archivos exitosos
             archivos_a_remover_exitosos = []
-            for nombre_archivo in data["archivos_exitosos"][tipo]:
+            for nombre_archivo in list(data["archivos_exitosos"][tipo].keys()):
                 ruta_completa = os.path.join(directorio, nombre_archivo)
                 if not os.path.exists(ruta_completa):
                     archivos_a_remover_exitosos.append(nombre_archivo)
 
             for nombre_archivo in archivos_a_remover_exitosos:
                 del data["archivos_exitosos"][tipo][nombre_archivo]
-                archivos_removidos_exitosos += 1
+                removidos_tipo_exitosos += 1
                 if logger:
                     logger.info(f"Removido de exitosos (archivo ya no existe): {nombre_archivo}")
 
             # Limpiar archivos fallidos
             archivos_a_remover_fallidos = []
-            for nombre_archivo in data["archivos_fallidos"][tipo]:
+            for nombre_archivo in list(data["archivos_fallidos"][tipo].keys()):
                 ruta_completa = os.path.join(directorio, nombre_archivo)
                 if not os.path.exists(ruta_completa):
                     archivos_a_remover_fallidos.append(nombre_archivo)
 
             for nombre_archivo in archivos_a_remover_fallidos:
                 del data["archivos_fallidos"][tipo][nombre_archivo]
-                archivos_removidos_fallidos += 1
+                removidos_tipo_fallidos += 1
                 if logger:
                     logger.info(f"Removido de fallidos (archivo ya no existe): {nombre_archivo}")
+
+            archivos_removidos_exitosos += removidos_tipo_exitosos
+            archivos_removidos_fallidos += removidos_tipo_fallidos
+            por_tipo[tipo] = {
+                "exitosos": removidos_tipo_exitosos,
+                "fallidos": removidos_tipo_fallidos
+            }
 
         total_removidos = archivos_removidos_exitosos + archivos_removidos_fallidos
         if total_removidos > 0:
             _escribir_json(log_directory, data)
             if logger:
                 logger.info(f"Limpieza completada: {archivos_removidos_exitosos} exitosos, {archivos_removidos_fallidos} fallidos removidos")
+
+        return {
+            "exitosos_removidos": archivos_removidos_exitosos,
+            "fallidos_removidos": archivos_removidos_fallidos,
+            "total_removidos": total_removidos,
+            "por_tipo": por_tipo
+        }
 
 
 def obtener_estadisticas(log_directory):
@@ -355,3 +382,60 @@ def obtener_estadisticas(log_directory):
         estadisticas["fallidos"]["total"] = sum(estadisticas["fallidos"].values())
 
         return estadisticas
+
+
+def obtener_resumen_diagnostico(log_directory, max_ultimos=5):
+    """
+    Genera un resumen estructurado para herramientas de diagnóstico.
+
+    Args:
+        log_directory: Directorio donde se guarda el JSON
+        max_ultimos: Cantidad máxima de archivos recientes a listar por tipo
+
+    Returns:
+        dict: Resumen con totales, desglose por tipo con últimos N archivos,
+              y lista detallada de fallidos activos.
+    """
+    with _file_lock:
+        data = _leer_json(log_directory)
+
+        resumen = {
+            "totales": {
+                "exitosos": 0,
+                "fallidos": 0
+            },
+            "detalle_por_tipo": {},
+            "fallidos_activos": []
+        }
+
+        for tipo in TIPOS_ARCHIVO:
+            exitosos_tipo = data["archivos_exitosos"].get(tipo, {})
+            fallidos_tipo = data["archivos_fallidos"].get(tipo, {})
+
+            cant_exitosos = len(exitosos_tipo)
+            cant_fallidos = len(fallidos_tipo)
+
+            resumen["totales"]["exitosos"] += cant_exitosos
+            resumen["totales"]["fallidos"] += cant_fallidos
+
+            # Ordenar los exitosos por fecha descendente (más recientes primero)
+            ultimos_exitosos = sorted(
+                exitosos_tipo.items(),
+                key=lambda item: item[1] if isinstance(item[1], str) else "",
+                reverse=True
+            )[:max_ultimos]
+
+            resumen["detalle_por_tipo"][tipo] = {
+                "exitosos": cant_exitosos,
+                "fallidos": cant_fallidos,
+                "ultimos": ultimos_exitosos
+            }
+
+            for nombre_archivo, fecha in fallidos_tipo.items():
+                resumen["fallidos_activos"].append({
+                    "tipo": tipo,
+                    "archivo": nombre_archivo,
+                    "fecha": fecha
+                })
+
+        return resumen

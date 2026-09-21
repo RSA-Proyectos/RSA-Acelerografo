@@ -99,6 +99,8 @@ PROJECT_GIT_ROOT=$PROJECT_GIT_ROOT PROJECT_LOCAL_ROOT=$PROJECT_LOCAL_ROOT python
 update_files_if_changed "$PROJECT_GIT_ROOT/scripts/operation/mqtt/" "$PROJECT_LOCAL_ROOT/scripts/mqtt/"
 update_files_if_changed "$PROJECT_GIT_ROOT/scripts/operation/mseed/" "$PROJECT_LOCAL_ROOT/scripts/mseed/"
 update_files_if_changed "$PROJECT_GIT_ROOT/scripts/operation/drive/" "$PROJECT_LOCAL_ROOT/scripts/drive/"
+mkdir -p "$PROJECT_LOCAL_ROOT/scripts/acelerografo"
+update_files_if_changed "$PROJECT_GIT_ROOT/scripts/operation/acelerografo/" "$PROJECT_LOCAL_ROOT/scripts/acelerografo/"
 
 # Actualizar nuevos módulos core y streaming
 mkdir -p "$PROJECT_LOCAL_ROOT/scripts/core"

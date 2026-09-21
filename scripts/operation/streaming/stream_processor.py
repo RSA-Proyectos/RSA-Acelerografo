@@ -389,6 +389,63 @@ class StreamProcessor:
             finally:
                 self._fd = None
 
+    def _pipe_es_valido(self) -> bool:
+        """
+        Verifica si el descriptor del pipe sigue asociado al archivo activo en disco.
+
+        Detecta si el archivo fue eliminado (unlink) o recreado con un inodo diferente
+        (por ejemplo, tras un reinicio de registro_continuo con ExecStartPre rm).
+
+        Returns:
+            True si self._fd es válido y coincide con el inodo de self._pipe_path en disco.
+            False si no existe, los inodos difieren o hay un error de I/O.
+        """
+        if self._fd is None:
+            return False
+        try:
+            if not os.path.exists(self._pipe_path):
+                return False
+            fd_stat = os.fstat(self._fd)
+            path_stat = os.stat(self._pipe_path)
+            return fd_stat.st_ino == path_stat.st_ino
+        except OSError:
+            return False
+
+    def _reconectar_pipe(self) -> bool:
+        """
+        Cierra el descriptor huérfano y reabre el named pipe cuando esté disponible.
+
+        Permite la autorrecuperación (self-healing) cuando el proceso productor
+        es reiniciado o recrea el pipe con un inodo nuevo.
+
+        Returns:
+            True si se restableció la conexión al pipe, False si se detuvo el processor.
+        """
+        self._logger.warning(
+            f"[PIPE_RECONNECT] Named pipe eliminado o recreado con nuevo inodo. "
+            f"Cerrando descriptor huérfano y reconectando a {self._pipe_path}..."
+        )
+        self._cerrar_pipe()
+        self._acumulador.clear()
+
+        wait = 0.5
+        while self._running:
+            try:
+                if os.path.exists(self._pipe_path):
+                    self._abrir_pipe()
+                    self._logger.info(
+                        f"[PIPE_RECONNECTED] Reconexión exitosa a {self._pipe_path} "
+                        f"(fd={self._fd}, O_RDWR|O_NONBLOCK)"
+                    )
+                    return True
+            except (PermissionError, OSError) as e:
+                self._logger.debug(f"[PIPE_RECONNECT_WAIT] Reintento fallido: {e}")
+
+            time.sleep(wait)
+            wait = min(wait * 1.5, 3.0)
+
+        return False
+
     # -----------------------------------------------------------------------
     # Bucle principal de lectura
     # -----------------------------------------------------------------------
@@ -401,11 +458,14 @@ class StreamProcessor:
             os.read() puede retornar menos bytes de los solicitados. El acumulador
             bytearray garantiza que siempre procesamos tramas completas de FRAME_SIZE.
 
-        Manejo de datos vacíos:
+        Manejo de datos vacíos y auto-recuperación (Self-Healing):
             Si os.read() retorna b'' (EOF) en modo O_RDWR, puede indicar que el
-            escritor cerró y aún no ha reabierto. Se duerme brevemente y se continúa.
+            escritor cerró o que el archivo fue desvinculado por rm en systemd.
+            Se verifica periódicamente la validez del inodo del descriptor. Si el
+            pipe fue recreado o eliminado, se ejecuta _reconectar_pipe() automáticamente.
         """
         ultimo_frame_time = time.monotonic()
+        ultimo_check_pipe = time.monotonic()
         advertencia_timeout_enviada = False
 
         self._logger.info("[STREAM_LOOP] Iniciando bucle de lectura.")
@@ -417,8 +477,16 @@ class StreamProcessor:
                 chunk = os.read(self._fd, bytes_faltantes)
 
                 if not chunk:
-                    # EOF transitorio (escritor cerró temporalmente): esperar y continuar
+                    # EOF transitorio o pipe desvinculado (inodo huérfano)
                     ahora = time.monotonic()
+                    if ahora - ultimo_check_pipe >= 1.0:
+                        ultimo_check_pipe = ahora
+                        if not self._pipe_es_valido():
+                            if self._reconectar_pipe():
+                                ultimo_frame_time = time.monotonic()
+                                advertencia_timeout_enviada = False
+                            continue
+
                     if not advertencia_timeout_enviada and (ahora - ultimo_frame_time) > READ_TIMEOUT_S:
                         self._logger.warning(
                             f"[STREAM_TIMEOUT] Sin datos en >{READ_TIMEOUT_S}s. "
@@ -440,12 +508,26 @@ class StreamProcessor:
 
             except BlockingIOError:
                 # O_RDWR + O_NONBLOCK: no hay datos disponibles, esperar
+                ahora = time.monotonic()
+                if ahora - ultimo_check_pipe >= 1.0:
+                    ultimo_check_pipe = ahora
+                    if not self._pipe_es_valido():
+                        if self._reconectar_pipe():
+                            ultimo_frame_time = time.monotonic()
+                            advertencia_timeout_enviada = False
+                        continue
                 time.sleep(0.005)
                 continue
             except OSError as e:
                 if self._running:
                     self._logger.error(f"[PIPE_READ_ERROR] Error leyendo pipe: {e}")
                     self.frames_error += 1
+                    # Intentar reconectar si el descriptor quedó inválido
+                    if not self._pipe_es_valido():
+                        if self._reconectar_pipe():
+                            ultimo_frame_time = time.monotonic()
+                            advertencia_timeout_enviada = False
+                            continue
                     time.sleep(0.1)
                 break
 

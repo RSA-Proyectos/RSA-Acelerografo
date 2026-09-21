@@ -517,6 +517,86 @@ def test_estadisticas_acumulan_correctamente():
 
 
 # ---------------------------------------------------------------------------
+# Tests: auto-recuperación (Self-Healing) del pipe
+# ---------------------------------------------------------------------------
+
+def test_pipe_es_valido_detecta_eliminacion():
+    """_pipe_es_valido() detecta cuando el archivo FIFO ha sido eliminado de disco."""
+    fifo_path = _make_temp_fifo()
+    try:
+        p = StreamProcessor(pipe_path=fifo_path, dry_run=True)
+        p._abrir_pipe()
+        assert p._pipe_es_valido() is True, "El pipe recién abierto debe ser válido"
+
+        # Eliminar el archivo del disco (simula rm -f)
+        os.unlink(fifo_path)
+        assert p._pipe_es_valido() is False, "El descriptor huérfano debe ser detectado como inválido"
+        p._cerrar_pipe()
+    finally:
+        _cleanup_fifo(fifo_path)
+
+
+def test_pipe_es_valido_detecta_cambio_inodo():
+    """_pipe_es_valido() detecta cuando el FIFO fue borrado y recreado con nuevo inodo."""
+    fifo_path = _make_temp_fifo()
+    try:
+        p = StreamProcessor(pipe_path=fifo_path, dry_run=True)
+        p._abrir_pipe()
+        assert p._pipe_es_valido() is True, "Pipe original debe ser válido"
+
+        # Simular recreación del FIFO por reinicio de registro_continuo
+        os.unlink(fifo_path)
+        os.mkfifo(fifo_path)
+
+        assert p._pipe_es_valido() is False, "El descriptor debe detectar cambio de inodo"
+        p._cerrar_pipe()
+    finally:
+        _cleanup_fifo(fifo_path)
+
+
+def test_autorrecuperacion_reconexion_tras_recrear_pipe():
+    """
+    StreamProcessor se reconecta automáticamente y reanuda la lectura sin reiniciar el proceso
+    cuando el named pipe es borrado y recreado con un nuevo inodo en tiempo de ejecución.
+    """
+    fifo_path = _make_temp_fifo()
+    try:
+        p = StreamProcessor(pipe_path=fifo_path, dry_run=True)
+
+        def _runner():
+            p.run()
+
+        t = threading.Thread(target=_runner, daemon=True)
+        t.start()
+        time.sleep(0.3)
+
+        # 1. Enviar primera trama por el pipe original
+        _escribir_en_pipe(fifo_path, _make_frame(hour=15, minute=0, second=0), delay_s=0.05)
+        time.sleep(0.4)
+        _assert_eq(p.frames_procesados, 1, "Primera trama procesada en pipe original")
+
+        # 2. Simular reinicio de registro_continuo (rm -f /tmp/my_pipe y mkfifo)
+        os.unlink(fifo_path)
+        time.sleep(0.2)
+        os.mkfifo(fifo_path)
+
+        # Dar margen al bucle de lectura (chequeo cada 1s) para detectar y reconectar
+        time.sleep(2.0)
+
+        # 3. Enviar segunda trama por el nuevo pipe recreado
+        _escribir_en_pipe(fifo_path, _make_frame(hour=15, minute=0, second=1), delay_s=0.05)
+        time.sleep(0.6)
+
+        p.stop()
+        t.join(timeout=2.0)
+
+        _assert_eq(p.frames_procesados, 2, "Debe haber procesado 2 tramas tras la auto-reconexión")
+        _assert_eq(p.frames_invalidos, 0, "Sin tramas inválidas")
+    finally:
+        _cleanup_fifo(fifo_path)
+
+
+# ---------------------------------------------------------------------------
 # Punto de entrada
 # ---------------------------------------------------------------------------
 
@@ -561,6 +641,11 @@ if __name__ == "__main__":
         ("estadísticas", [
             test_estadisticas_iniciales_son_cero,
             test_estadisticas_acumulan_correctamente,
+        ]),
+        ("auto-recuperación (Self-Healing) del pipe", [
+            test_pipe_es_valido_detecta_eliminacion,
+            test_pipe_es_valido_detecta_cambio_inodo,
+            test_autorrecuperacion_reconexion_tras_recrear_pipe,
         ]),
     ]
 

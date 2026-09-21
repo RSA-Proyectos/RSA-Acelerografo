@@ -32,12 +32,12 @@
         },  
         "politicas": {
             "online": {
-                "subir": ["mseed"],
-                "retener_dias": {"continuous": 30, "mseed": 30}
+                "subir": ["mseed", "event"],
+                "retener_dias": {"continuous": 30, "mseed": 30, "event": 30}
             },
             "offline": {
                 "subir": [],
-                "retener_dias": {"continuous": 7}
+                "retener_dias": {"continuous": 7, "event": 30}
             }
         }
     },

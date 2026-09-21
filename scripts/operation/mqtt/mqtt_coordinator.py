@@ -4,6 +4,7 @@ import os
 import json
 import time
 import threading
+import subprocess
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import paho.mqtt.client as mqtt
@@ -19,15 +20,21 @@ from event_extractor import extraer_y_subir_evento
 # Importar EventLogger para registro CSV de detecciones sísmicas
 from core.event_logger import EventLogger
 
-# Importar AcquisitionWatchdog para monitoreo de frescura de tramas
+# Importar auditores especializados (adquisición, sensor físico y Google Drive)
 from mqtt.acquisition_watchdog import AcquisitionWatchdog
+try:
+    from mqtt.sensor_watchdog import SensorWatchdog
+    from mqtt.drive_watchdog import DriveWatchdog
+except ImportError:
+    from sensor_watchdog import SensorWatchdog
+    from drive_watchdog import DriveWatchdog
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CONFIGURACIÓN Y CONSTANTES
 # ═══════════════════════════════════════════════════════════════════════════
 
-HEALTH_INTERVAL = 300    # segundos
-ACQUISITION_CHECK_INTERVAL = 60  # segundos entre chequeos de frescura del Ring Buffer
+HEALTH_INTERVAL = 300    # segundos (5 minutos)
+ACQUISITION_CHECK_INTERVAL = 300  # segundos entre chequeos (unificado a 5 minutos)
 DAILY_REPUBLISH_HOUR = 0  # Hora para re-publicar estado diario (00:00)
 START_TIME = time.time()
 
@@ -89,16 +96,21 @@ def guardar_estado(estado: str, timestamp: str, state_file_path: str, logger: St
 class CommandDispatcher:
     """Centraliza el manejo de comandos recibidos via MQTT."""
     
-    def __init__(self, config: dict, logger: StructuredLogger, event_logger=None, watchdog=None):
+    def __init__(self, config: dict, logger: StructuredLogger, event_logger=None, watchdog=None, sensor_watchdog=None, drive_watchdog=None):
         self.config = config
         self.logger = logger
         self.event_logger = event_logger  # EventLogger para CSV de detecciones
         self.watchdog = watchdog          # AcquisitionWatchdog para latencia del Ring Buffer
+        self.sensor_watchdog = sensor_watchdog  # SensorWatchdog para integridad triaxial/reloj
+        self.drive_watchdog = drive_watchdog    # DriveWatchdog para auditoría Drive/disco
         self.handlers = {
             "restart_acquisition": self._cmd_restart_acquisition,
+            "stop_acquisition_safety": self._cmd_stop_acquisition_safety,
             "cleanup_files": self._cmd_cleanup_files,
             "get_status": self._cmd_get_status,
             "get_acquisition_status": self._cmd_get_acquisition_status,
+            "get_sensor_status": self._cmd_get_sensor_status,
+            "get_drive_status": self._cmd_get_drive_status,
             "extract_event": self._cmd_extract_event,
         }
     
@@ -116,6 +128,53 @@ class CommandDispatcher:
         """Reinicia el proceso de adquisición."""
         # TODO: Implementar interacción con capa de adquisición
         return {"status": "pending", "message": "Not implemented yet"}
+
+    def _cmd_stop_acquisition_safety(self, payload: dict, client) -> dict:
+        """
+        Detiene ordenadamente el servicio systemd de adquisición por contingencia de seguridad
+        (p. ej. si se detecta daño físico permanente en el acelerómetro para no inundar el disco ni disparar falsas alarmas).
+        """
+        self.logger.warning("[CMD_SAFETY] Recibida orden de parada de seguridad de adquisición continua.")
+        try:
+            res = subprocess.run(
+                ["sudo", "systemctl", "stop", "rsa-acelerografo.service"],
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            if res.returncode == 0:
+                self.logger.warning("[CMD_SAFETY] Servicio rsa-acelerografo.service detenido exitosamente.")
+                return {
+                    "status": "completed",
+                    "action": "stop_acquisition_safety",
+                    "message": "Servicio rsa-acelerografo detenido ordenadamente.",
+                    "timestamp": timestamp_iso()
+                }
+            else:
+                stderr = res.stderr.strip() or "Código de retorno no cero al detener servicio"
+                self.logger.error(f"[CMD_SAFETY_ERR] Falló detención: {stderr}")
+                return {
+                    "status": "error",
+                    "action": "stop_acquisition_safety",
+                    "message": stderr,
+                    "timestamp": timestamp_iso()
+                }
+        except subprocess.TimeoutExpired:
+            self.logger.error("[CMD_SAFETY_ERR] Timeout al ejecutar systemctl stop rsa-acelerografo.service")
+            return {
+                "status": "error",
+                "action": "stop_acquisition_safety",
+                "message": "Timeout ejecutando systemctl stop",
+                "timestamp": timestamp_iso()
+            }
+        except Exception as exc:
+            self.logger.error(f"[CMD_SAFETY_ERR] Excepción en parada de seguridad: {exc}")
+            return {
+                "status": "error",
+                "action": "stop_acquisition_safety",
+                "message": str(exc),
+                "timestamp": timestamp_iso()
+            }
     
     def _cmd_cleanup_files(self, payload: dict, client) -> dict:
         """Limpieza de archivos temporales."""
@@ -137,6 +196,26 @@ class CommandDispatcher:
         return {
             "status": "error",
             "reason": "watchdog_not_available",
+            "timestamp": timestamp_iso()
+        }
+
+    def _cmd_get_sensor_status(self, payload: dict, client) -> dict:
+        """Retorna el estado de integridad física del sensor bajo demanda."""
+        if self.sensor_watchdog is not None:
+            return self.sensor_watchdog.evaluar_integridad(station_id=self.config["id"])
+        return {
+            "status": "error",
+            "reason": "sensor_watchdog_not_available",
+            "timestamp": timestamp_iso()
+        }
+
+    def _cmd_get_drive_status(self, payload: dict, client) -> dict:
+        """Retorna el estado de sincronización de Google Drive bajo demanda."""
+        if self.drive_watchdog is not None:
+            return self.drive_watchdog.evaluar_sincronizacion(station_id=self.config["id"])
+        return {
+            "status": "error",
+            "reason": "drive_watchdog_not_available",
             "timestamp": timestamp_iso()
         }
 
@@ -357,7 +436,7 @@ def publicar_health(client, config: dict, logger: StructuredLogger):
     client.publish(topic, json.dumps(metricas), qos=qos, retain=retain)
 
 def publicar_acquisition_status(client, config: dict, watchdog: AcquisitionWatchdog, logger: StructuredLogger):
-    """Publica estado de frescura y latencia de adquisición en MQTT cada ACQUISITION_CHECK_INTERVAL segundos."""
+    """Publica estado de frescura y latencia de adquisición en MQTT cada 300 segundos."""
     try:
         topic = resolver_topico(config, "status_acquisition")
     except KeyError:
@@ -370,8 +449,8 @@ def publicar_acquisition_status(client, config: dict, watchdog: AcquisitionWatch
         )
 
     payload = watchdog.evaluar_salud(station_id=config["id"])
-    qos = config["qos"].get("telemetry", 1)
-    retain = config.get("retain", {}).get("status_acquisition", False)
+    qos = config.get("qos", {}).get("telemetry", 1)
+    retain = config.get("retain", {}).get("status_acquisition", True)
     client.publish(topic, json.dumps(payload), qos=qos, retain=retain)
 
     status = payload.get("status")
@@ -387,6 +466,69 @@ def publicar_acquisition_status(client, config: dict, watchdog: AcquisitionWatch
     else:
         logger.info(
             f"[ACQUISITION_OK] Adquisición nominal: age={payload.get('age_seconds')}s"
+        )
+
+def publicar_sensor_status(client, config: dict, sensor_watchdog: SensorWatchdog, logger: StructuredLogger):
+    """Publica estado de integridad física del sensor y reloj en MQTT cada 300 segundos."""
+    try:
+        topic = resolver_topico(config, "status_sensor")
+    except KeyError:
+        template = "{org}/{app}/{cap}/{id}/status/sensor"
+        topic = template.format(
+            org=config.get("org", "rsa"),
+            app=config.get("app", "seismic"),
+            cap=config.get("cap", "smart"),
+            id=config.get("id", "UNKNOWN")
+        )
+
+    payload = sensor_watchdog.evaluar_integridad(station_id=config["id"])
+    qos = config.get("qos", {}).get("telemetry", 1)
+    retain = config.get("retain", {}).get("status_sensor", True)
+    client.publish(topic, json.dumps(payload), qos=qos, retain=retain)
+
+    status = payload.get("status")
+    if status == "ok":
+        logger.info(
+            f"[SENSOR_OK] Integridad nominal: ax={payload.get('ax')} "
+            f"ay={payload.get('ay')} az={payload.get('az')} "
+            f"clock={payload.get('clock_source')}"
+        )
+    else:
+        logger.warning(
+            f"[SENSOR_ANOMALY] Anomalía en sensor/reloj: {payload.get('reason')} "
+            f"({payload.get('clock_error')})"
+        )
+
+def publicar_drive_status(client, config: dict, drive_watchdog: DriveWatchdog, logger: StructuredLogger):
+    """Publica estado de sincronización con Google Drive y espacio en disco en MQTT cada 300 segundos."""
+    try:
+        topic = resolver_topico(config, "status_drive")
+    except KeyError:
+        template = "{org}/{app}/{cap}/{id}/status/drive"
+        topic = template.format(
+            org=config.get("org", "rsa"),
+            app=config.get("app", "seismic"),
+            cap=config.get("cap", "smart"),
+            id=config.get("id", "UNKNOWN")
+        )
+
+    payload = drive_watchdog.evaluar_sincronizacion(station_id=config["id"])
+    qos = config.get("qos", {}).get("telemetry", 1)
+    retain = config.get("retain", {}).get("status_drive", True)
+    client.publish(topic, json.dumps(payload), qos=qos, retain=retain)
+
+    status = payload.get("status")
+    if status == "ok":
+        logger.info(
+            f"[DRIVE_SYNC_OK] Sincronización nominal: pendientes={payload.get('pending_mseed')}, "
+            f"protegidos={payload.get('failed_uploads_protected')}, "
+            f"disco_libre={payload.get('free_disk_percent')}%"
+        )
+    else:
+        logger.warning(
+            f"[DRIVE_WARN] Alerta en sincronización: {payload.get('reason')} "
+            f"(pendientes={payload.get('pending_mseed')}, "
+            f"protegidos={payload.get('failed_uploads_protected')})"
         )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -405,12 +547,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
     
     if rc == 0:
         logger.mqtt_connect(config["broker"]["address"], "ok")
-        
-        # Suscribirse a tópicos configurados
-        for sub_key in config["subscriptions"]:
-            topic = resolver_topico(config, sub_key)
-            client.subscribe(topic, qos=config["qos"].get("commands", 1))
-            logger.mqtt_subscribe(topic, 1)
+        userdata["is_connected"] = True
         
         # Publicar estado online diferido si es el primer arranque
         state_file = userdata["state_file_path"]
@@ -430,7 +567,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
             except Exception as e:
                 logger.error(f"[BOOT_SYNC_ERR] Error leyendo {state_file}: {e}")
 
-        # Intentar publicar 'online'
+        # Publicar 'online' de forma prioritaria inmediatamente al conectar
         now_ts = timestamp_iso()
         msg_info = publicar_state(client, config, "online", logger, timestamp_override=now_ts)
         
@@ -439,12 +576,19 @@ def on_connect(client, userdata, flags, rc, properties=None):
             guardar_estado("online", now_ts, userdata["state_file_path"], logger)
             userdata["last_state_change"] = now_ts
             userdata["is_disconnected_logged"] = False
+
+        # Suscribirse a tópicos configurados
+        for sub_key in config["subscriptions"]:
+            topic = resolver_topico(config, sub_key)
+            client.subscribe(topic, qos=config["qos"].get("commands", 1))
+            logger.mqtt_subscribe(topic, 1)
     else:
         logger.mqtt_error("connect", f"Código de error: {rc}")
 
 def on_disconnect(client, userdata, flags, rc=None, properties=None):
     """Callback de desconexión del broker."""
     logger = userdata["logger"]
+    userdata["is_connected"] = False
     # En v1, flags es el código de retorno (rc). En v2, rc es el reason_code.
     real_rc = rc if rc is not None else flags
     
@@ -676,7 +820,15 @@ def iniciar_cliente(config: dict, logger: StructuredLogger, userdata: dict):
     """Inicializa y configura el cliente MQTT."""
     event_logger = userdata.get("event_logger")
     watchdog = userdata.get("watchdog")
-    dispatcher = CommandDispatcher(config, logger, event_logger=event_logger, watchdog=watchdog)
+    sensor_watchdog = userdata.get("sensor_watchdog")
+    drive_watchdog = userdata.get("drive_watchdog")
+    dispatcher = CommandDispatcher(
+        config, logger,
+        event_logger=event_logger,
+        watchdog=watchdog,
+        sensor_watchdog=sensor_watchdog,
+        drive_watchdog=drive_watchdog
+    )
     correlator = EventCorrelator(config, logger)
 
     userdata.update({
@@ -768,6 +920,11 @@ def main():
     )
     watchdog = AcquisitionWatchdog(ring_dir=ring_dir, logger=logger)
 
+    # Inicializar SensorWatchdog y DriveWatchdog
+    sensor_watchdog = SensorWatchdog()
+    mseed_dir = device_config.get("directorios", {}).get("archivos_mseed", "/home/rsa/data/mseed/")
+    drive_watchdog = DriveWatchdog(mseed_dir=mseed_dir)
+
     # Preparar userdata para el cliente
     userdata = {
         "config": config,
@@ -775,19 +932,21 @@ def main():
         "device_config": device_config,
         "event_logger": event_logger,
         "watchdog": watchdog,
+        "sensor_watchdog": sensor_watchdog,
+        "drive_watchdog": drive_watchdog,
         "state_file_path": state_file,
         "boot_published": False,
         "last_state_change": None,
-        "is_disconnected_logged": False
+        "is_disconnected_logged": False,
+        "is_connected": False
     }
     
     # Iniciar cliente
     client = iniciar_cliente(config, logger, userdata)
     client.loop_start()
     
-    # Loop principal con timers de telemetría, adquisición y re-publicación diaria
+    # Loop principal con timers de telemetría sincronizados cada 300 s (5 minutos)
     last_health = 0
-    last_acquisition_check = 0
     last_day = datetime.now(timezone.utc).day
     
     try:
@@ -796,21 +955,18 @@ def main():
             
             if now - last_health >= HEALTH_INTERVAL:
                 publicar_health(client, config, logger)
-                last_health = now
-
-            if now - last_acquisition_check >= ACQUISITION_CHECK_INTERVAL:
                 publicar_acquisition_status(client, config, watchdog, logger)
-                last_acquisition_check = now
-            
-            # Re-publicación diaria a las 00:00
-            now_dt = datetime.now(timezone.utc)
-            if now_dt.day != last_day and now_dt.hour >= DAILY_REPUBLISH_HOUR:
-                last_change = userdata.get("last_state_change")
-                # Si no hay last_change (no conectó), no re-publicamos 'online'
-                if last_change:
-                    logger.info(f"[DAILY_SYNC] Re-publicando estado online (vía {last_change})")
-                    publicar_state(client, config, "online", logger, timestamp_override=last_change)
-                last_day = now_dt.day
+                publicar_sensor_status(client, config, sensor_watchdog, logger)
+                publicar_drive_status(client, config, drive_watchdog, logger)
+                
+                # Heartbeat periódico de estado (Opción A: refresca retained en broker con timestamp original)
+                if client.is_connected() or userdata.get("is_connected", False):
+                    online_ts = userdata.get("last_state_change")
+                    if online_ts:
+                        logger.info(f"[HEARTBEAT_STATE] Refrescando telemetry_state (online desde {online_ts})")
+                        publicar_state(client, config, "online", logger, timestamp_override=online_ts)
+                
+                last_health = now
             
             # Re-publicación diaria a las 00:00
             now_dt = datetime.now(timezone.utc)
