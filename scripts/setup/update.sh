@@ -274,4 +274,20 @@ fi
 # Revisar y actualizar el entorno virtual
 update_venv_if_changed
 
+# --- BLINDAJE DE PERMISOS ---
+# Restaurar la titularidad al usuario operativo (rsa) evitando bloqueos de permisos en logs y proyecto
+TARGET_USER="${SUDO_USER:-$USER}"
+if [ "$TARGET_USER" = "root" ] && id "rsa" &>/dev/null; then
+    TARGET_USER="rsa"
+fi
+
+if [ -n "$PROJECT_LOCAL_ROOT" ] && [ -d "$PROJECT_LOCAL_ROOT" ]; then
+    echo "Aplicando blindaje de permisos en $PROJECT_LOCAL_ROOT para usuario: $TARGET_USER..."
+    sudo chown -R "$TARGET_USER:$TARGET_USER" "$PROJECT_LOCAL_ROOT"
+    sudo chmod -R u+rwX "$PROJECT_LOCAL_ROOT"
+    if [ -d "$PROJECT_LOCAL_ROOT/log-files" ]; then
+        sudo chmod -R u+rwX,g+rwX "$PROJECT_LOCAL_ROOT/log-files"
+    fi
+fi
+
 echo "Actualización completada con éxito."
