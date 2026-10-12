@@ -1,19 +1,21 @@
 ---
 proyecto: acelerografo-DEV00
 tipo: diagnostico_tecnico
-resolucion: pendiente
-temas: [memoria, livelock, drive, bufferbloat, ssh, crontab, resiliencia, concurrencia]
+resolucion: en_mitigacion
+temas: [memoria, livelock, drive, bufferbloat, ssh, crontab, resiliencia, concurrencia, dns, store-and-forward]
 fecha: 2026-09-30
+fecha_actualizacion: 2026-10-02
 ---
 
 # Diagnóstico Técnico: Saturación Crítica de Memoria, Concurrencia Descontrolada en Subidas a Drive y Bloqueo de Acceso Remoto en Estaciones Acelerográficas
 
-**Fecha**: 2026-09-30  
+**Fecha Inicial**: 2026-09-30  
+**Última Actualización**: 2026-10-02  
 **Proyecto / Repositorio**: `acelerografo-DEV00`  
-**Componente(s) afectado(s)**: `scripts/task/registrocontinuo.sh`, `scripts/operation/drive/gestor_archivos_acq.py`, `scripts/operation/drive/subir_archivo.py`, `scripts/operation/mqtt/mqtt_coordinator.py`, subsistema de memoria del kernel (`sshd`, `crontab`)  
-**Estación(es) bajo análisis**: `CHA02` (incidente crítico de livelock), con antecedentes correlacionados en `CHA01`  
-**Estado**: Diagnosticado (pendiente de intervención física en campo y refactorización preventiva)  
-**Severidad**: Crítica (provocó pérdida total de control remoto SSH y telemetría MQTT en la estación `CHA02`)  
+**Componente(s) afectado(s)**: `scripts/task/registrocontinuo.sh`, `scripts/operation/drive/gestor_archivos_acq.py`, `scripts/operation/drive/subir_archivo.py`, `scripts/operation/drive/drive_status_manager.py`, `scripts/operation/mqtt/mqtt_coordinator.py`, subsistema de resolución DNS (`/etc/resolv.conf`), `crontab` y subsistema de memoria (`sshd`)  
+**Estación(es) bajo análisis**: `CHA02` (incidente crítico de livelock resuelto) y `CHA01` (comportamiento correlacionado en la misma red corporativa)  
+**Estado**: En Mitigación (intervención física completada, backlog histórico evacuado, fallos de arquitectura caracterizados y mitigaciones temporales activas; pendiente planificación de refactorización definitiva)  
+**Severidad**: Crítica (provocó pérdida de control remoto SSH y telemetría MQTT en `CHA02`, duplicación masiva en Google Drive y riesgo de recurrencia en `CHA01`)  
 
 ---
 
@@ -21,230 +23,205 @@ fecha: 2026-09-30
 
 Durante la última semana de septiembre de 2026 se registró una falla sistémica en la estación acelerográfica de campo **`CHA02`**, manifestada inicialmente por un consumo de memoria RAM superior al 98.5%, desconexiones recurrentes de telemetría MQTT y la imposibilidad absoluta de establecer sesiones remotas por SSH desde el concentrador local (`concentrador-CON00`).
 
-La investigación técnica demostró que el incidente fue consecuencia de un **efecto dominó en cascada**:
-1. Un fallo preliminar de resolución DNS corporativa y posterior agotamiento de cuota en Google Drive impidió la evacuación normal de datos MiniSEED, acumulando una cola masiva de **761 archivos pendientes ($\approx 2.6\text{ GB}$)**.
-2. Al intentar procesar este volumen acumulado, el script [`scripts/operation/drive/gestor_archivos_acq.py`](file:///home/rsa/git/montajes/acelerografo-DEV00/scripts/operation/drive/gestor_archivos_acq.py) entró en un bucle voraz e ininterrumpido de transferencias HTTPS hacia Google Drive, saturando el ancho de banda de subida (*uplink*) y provocando un fenómeno severo de *bufferbloat*.
-3. La tarea programada en [`scripts/task/crontab.txt`](file:///home/rsa/git/montajes/acelerografo-DEV00/scripts/task/crontab.txt) invoca a cada hora en punto (`0 * * * *`) el script [`scripts/task/registrocontinuo.sh`](file:///home/rsa/git/montajes/acelerografo-DEV00/scripts/task/registrocontinuo.sh), el cual lanza en segundo plano (`&`) una nueva instancia de `gestor_archivos_acq.py` **sin verificar si la ejecución de la hora previa seguía viva y sin mecanismos de exclusión mutua (*file lock*)**.
-4. La acumulación de múltiples instancias concurrentes de Python compitiendo por memoria en una Raspberry Pi 3B+ (1 GB de RAM física) devoró la memoria disponible, empujando al kernel a un **livelock por memoria (*swap thrashing*)** en la tarjeta microSD lenta. En este estado, el daemon `sshd` no pudo realizar llamadas `fork()` para atender conexiones entrantes.
+La investigación técnica forense demostró una cadena de fallas interconectadas:
 
-Se aplicaron maniobras de mitigación desde la red y la nube (incluyendo el envío temporal de la carpeta de Drive a la Papelera para abortar la transferencia pesada y el disparo del comando MQTT `stop_acquisition_safety`), logrando reabrir temporalmente los puertos TCP 22 y 5000 a nivel de socket. Sin embargo, el estado de livelock de memoria acumulado en los daemons de Supervisor impidió la recuperación interactiva sin un reinicio del sistema operativo. Se ha programado una visita presencial para la próxima semana a fin de ejecutar el ciclo de energía físico y se estructura el backlog para blindar el software contra esta clase de contingencias.
+1. **Falso Positivo en Detección de Conectividad**: La función `check_internet_connection()` en `gestor_archivos_acq.py` validaba salida a Internet mediante socket TCP directo a la IP `8.8.8.8:53`. En la red corporativa donde operan las estaciones `CHA01` y `CHA02`, la conectividad IP pura estaba activa, pero el servidor DNS corporativo asignado (`192.170.100.250`) fallaba sistemáticamente en resolver los dominios de Google (`www.googleapis.com` -> `Temporary failure in name resolution`).
+2. **Bucle de Timeouts Extendido y Avalancha Horaria**: Al asumir erróneamente que había conexión plena a Google Drive, el gestor iniciaba la subida de cada archivo en cola, ejecutando 5 reintentos con timeouts de hasta 30-60 segundos por archivo. Con una cola de decenas o cientos de archivos, la ejecución tardaba más de 1 hora.
+3. **Invocación Concurrente sin Exclusión Mutua (*Race Condition*)**: El script `registrocontinuo.sh`, invocado cada hora en punto (`0 * * * *`) por `cron`, lanzaba una nueva instancia de `gestor_archivos_acq.py &` en segundo plano sin verificar si la ejecución previa continuaba viva ni usar cerrojos (`flock` o `pgrep`).
+4. **Duplicación Masiva en Drive y Desincronización de Registro**: Se llegaron a acumular hasta 9 procesos concurrentes del gestor. Dado que Google Drive permite múltiples archivos con el mismo nombre en una carpeta, cada proceso subía réplicas de los mismos archivos (hasta 9 copias duplicadas por archivo), saturando la cuota de almacenamiento de Drive. Asimismo, la concurrencia desordenada de escrituras atómicas en `uploaded_files_registry.json` y problemas de permisos (`root:root`) provocaban que las subidas exitosas no se persistieran localmente.
+5. **Livelock de Memoria (*Swap Thrashing*)**: Los múltiples procesos de Python acumulados en la Raspberry Pi 3B+ (1 GB de RAM física) agotaron la memoria disponible, forzando un intercambio continuo con la tarjeta microSD lenta que impidió a `sshd` invocar `fork()` para atender sesiones remotas.
 
----
-
-## 2. Estado Actual
-
-| Componente / Servicio | Estado Operativo | Observaciones Técnicas |
-|---|---|---|
-| **Pipeline SPI (`rsa-acelerografo.service`)** | ⚠️ Desconocido / Reactivado | Fue detenido vía MQTT (liberó 2% de RAM), pero el cron horario a las 16:00 lo reactivó automáticamente. |
-| **Daemon `stream_processor` (Supervisor)** | ❌ Inaccesible / Livelock | Retiene memoria pasiva tras >8 días de ejecución ininterrumpida; vulnerable a thrashing. |
-| **Daemon `gpd_worker` (Supervisor)** | ❌ Inaccesible / Livelock | Modelo de IA residente en memoria; principal consumidor de RAM base en la Raspberry Pi. |
-| **Daemon `mqtt_coordinator` (Supervisor)** | ❌ Desconectado | Dejó de emitir telemetría al broker tras colapso del bucle de eventos por memoria exhausta. |
-| **Servidor Web `config_server` (Supervisor)** | ⚠️ Socket TCP Abierto | Puerto 5000 responde a nivel de SYN-ACK en red local, pero no atiende peticiones HTTP completas. |
-| **Daemon SSH (`sshd`)** | ❌ Conexión Rechazada / Timeout | Puerto 22 responde TCP en red local (0.76 ms), pero aborta en autenticación o fork (`ENOMEM`). |
-| **Conectividad de Red Local (LAN)** | ✅ Operativa | Ping entre `concentrador-CON00` y `172.22.150.53` responde con $0.76\text{ ms}$ y $0\%$ pérdida. |
-| **Almacenamiento Local (microSD)** | ✅ Seguro | Datos protegidos bajo sistema ext4 con journal; retención estricta impide borrado de archivos no subidos. |
+### Evolución y Mitigaciones Temporales (01 y 02 de Octubre de 2026)
+* **01 de Octubre**: Se realizó un reseteo físico en campo de `CHA02`. Se comprobó que el hardware, los sensores y la adquisición SPI estaban 100% nominales. Tras la eliminación accidental de la carpeta en Google Drive, se configuraron nuevos destinos y se desarrolló e implementó el script de contingencia `evacuacion_controlada_drive.py`. Dicho script —blindado con `flock`, priorización de eventos, pausas de 1.5s y recolección de basura periódica— **evacuó con éxito 1,934 archivos acumulados** (1,283 eventos y 651 miniSEED), permitiendo que la política de retención liberara espacio hasta 7.8 GB libres (72% de uso).
+* **02 de Octubre**: Al generarse nuevos archivos horarios, volvieron a estancarse por persistencia de la falla de resolución DNS en el servidor corporativo `192.170.100.250`. Se adoptó el criterio prudencial de **no modificar los DNS corporativos**, pausar el cron horario en `CHA02` y monitorear `CHA01` (que reporta picos de RAM análogos en cada hora), operando con almacenamiento local seguro (capacidad para >90 días).
+* **Efecto Colateral Actual**: La desactivación del cron de emergencia previene el desborde de memoria, pero **paraliza también la conversión horaria de binario a miniSEED (`binary_to_mseed.py`)**, lo cual exige una refactorización desacoplada definitiva.
 
 ---
 
-## 3. Evidencia y Análisis
+## 2. Estado Actual de las Estaciones (al 2026-10-02)
+
+| Componente / Subsistema | `CHA02` | `CHA01` | Observaciones Técnicas |
+|---|---|---|---|
+| **Pipeline SPI (`rsa-acelerografo.service`)** | ✅ Operativo | ✅ Operativo | Activo y nominal; genera tramas y ring buffer continuamente. |
+| **Daemons Supervisor (`stream`, `gpd`, `mqtt`)** | ✅ Operativo | ✅ Operativo | Todos en estado `RUNNING` con consumo de memoria estabilizado. |
+| **Acceso Remoto SSH (`sshd`)** | ✅ Operativo | ✅ Operativo | Restaurado tras el ciclo de energía físico; responde sin latencia. |
+| **Sensores e Integridad de Reloj** | ✅ Nominal | ✅ Nominal | Triaxial respondiendo en milisegundos; NTP sincronizado (`0.0s`). |
+| **Almacenamiento Local (Disco)** | ✅ 7.8 GB libres (72%) | ✅ Saludable | Espacio recuperado tras evacuación exitosa de 1,934 archivos. |
+| **Resolución DNS Corporativa** | ❌ Falla (`192.170.100.250`) | ❌ Falla (`192.170.100.250`) | `ping 8.8.8.8` OK (28 ms), pero `www.googleapis.com` falla por resolución. |
+| **Tarea Programada `crontab`** | ⏸️ Pausada (`#0 * * * *`) | ⚠️ Activa con picos RAM | En `CHA02` pausada para evitar livelock; en `CHA01` genera picos horarios. |
+| **Conversión Horaria (`binary_to_mseed.py`)** | ⏸️ Paralizada (por pausa de cron) | ⚠️ Activa en cron | Requiere desacoplamiento urgente de la subida a Drive. |
+
+---
+
+## 3. Evidencia y Análisis Forense
 
 ### 3.1. Prueba de Enlace y Conectividad Física Local
-Desde `concentrador-CON00` hacia la estación `CHA02` (`172.22.150.53`):
+Desde `concentrador-CON00` hacia `CHA02` (`172.22.150.53`):
 ```text
 rsa@concentrador-CON00:~ $ ping -c 5 172.22.150.53
-PING 172.22.150.53 (172.22.150.53) 56(84) bytes of data.
-64 bytes from 172.22.150.53: icmp_seq=1 ttl=64 time=0.790 ms
-64 bytes from 172.22.150.53: icmp_seq=2 ttl=64 time=0.716 ms
-64 bytes from 172.22.150.53: icmp_seq=3 ttl=64 time=0.761 ms
-64 bytes from 172.22.150.53: icmp_seq=4 ttl=64 time=0.751 ms
-64 bytes from 172.22.150.53: icmp_seq=5 ttl=64 time=0.787 ms
-
---- 172.22.150.53 ping statistics ---
 5 packets transmitted, 5 received, 0% packet loss, time 136ms
 rtt min/avg/max/mdev = 0.716/0.761/0.790/0.027 ms
 ```
-*Análisis*: La infraestructura de red física, el conmutador Ethernet y la interfaz de red del kernel responden en submilisegundos ($0.76\text{ ms}$). No hay avería de cableado ni corte de energía.
+*Diagnóstico*: La conectividad local y el hardware de red operan en submilisegundos sin pérdidas.
 
 ---
 
-### 3.2. Diagnóstico del Servicio SSH y Puertos Locales
-Al probar la conexión mediante socket TCP puro en Python:
+### 3.2. Falso Positivo en Detección de Conectividad (`check_internet_connection`)
+En [`scripts/operation/drive/gestor_archivos_acq.py`](file:///home/rsa/git/montajes/acelerografo-DEV00/scripts/operation/drive/gestor_archivos_acq.py#L95-L105):
 ```python
-Puerto    22: ABIERTO
-Puerto  5000: ABIERTO
-Puerto    80: RECHAZADO
+def check_internet_connection(logger, host="8.8.8.8", port=53, timeout=3):
+    try:
+        socket.setdefaulttimeout(timeout)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((host, port))
+        sock.close()
+        logger.info("Conexión a internet verificada.")
+        return True
+    except Exception as e:
+        logger.warning(f"Fallo en la conexión a internet: {e}")
+        return False
 ```
-Sin embargo, al intentar la sesión SSH con `ssh -vvv -o ConnectTimeout=60 -T CHA02 "sudo /sbin/reboot -f"`:
+*Evidencia en la estación*:
 ```text
-debug1: Connecting to 172.22.150.53 [172.22.150.53] port 22.
-debug2: fd 3 setting O_NONBLOCK
-debug1: connect to address 172.22.150.53 port 22: Connection timed out
-ssh: connect to host 172.22.150.53 port 22: Connection timed out
+rsa@CHA02:~$ ping -c 3 8.8.8.8
+3 packets transmitted, 3 received, 0% packet loss, time 2003ms
+rtt min/avg/max/mdev = 27.867/29.928/33.891/2.802 ms
+
+rsa@CHA02:~$ ping -c 3 www.googleapis.com
+ping: www.googleapis.com: Temporary failure in name resolution
 ```
-*Análisis*: El socket del puerto 22 se encuentra abierto en el stack TCP del kernel, pero cuando el cliente intenta progresar en la negociación del túnel cifrado, la llamada `fork()` de `sshd` o la lectura de disco en la swap congelada sobrepasa el tiempo límite, cerrando el canal antes de admitir comandos.
+*Análisis*: La prueba conecta a la IP `8.8.8.8:53`. Como el gateway corporativo enruta paquetes hacia el exterior, la función devuelve `True`, engañando al gestor para iniciar la transferencia de archivos sin validar si el dominio del servicio destino (`www.googleapis.com`) es resoluble.
 
 ---
 
-### 3.3. Inspección del Crontab Horario y Falta de Lock
-En [`scripts/task/crontab.txt`](file:///home/rsa/git/montajes/acelerografo-DEV00/scripts/task/crontab.txt#L2):
-```cron
-0 * * * * sleep 30 && /usr/local/bin/registrocontinuo start
-```
-Y en [`scripts/task/registrocontinuo.sh`](file:///home/rsa/git/montajes/acelerografo-DEV00/scripts/task/registrocontinuo.sh#L18-L34):
+### 3.3. Acumulación por Timeouts de DNS y Concurrencia en `registrocontinuo.sh`
+En [`scripts/task/registrocontinuo.sh`](file:///home/rsa/git/montajes/acelerografo-DEV00/scripts/task/registrocontinuo.sh#L27-L34):
 ```bash
-case "$1" in
-  start)
-    if systemctl is-active --quiet rsa-acelerografo.service; then
-      echo "registro_continuo ya está ejecutándose (systemd)"
-    else
-      echo "Iniciando registro_continuo via systemd..."
-      sudo systemctl start rsa-acelerografo.service
-      sleep 3
-    fi
-    
-    # 2. Conversión horaria
+    # 2. Ejecutar conversión binary_to_mseed (esperar a que termine)
+    echo "Ejecutando conversión a miniSEED..."
     "$VENV_PYTHON" "$PROJECT_LOCAL_ROOT/scripts/mseed/binary_to_mseed.py" 1
     
-    # 3. Gestor de archivos en background
+    # 3. Ejecutar gestor de archivos
+    echo "Ejecutando gestor de archivos..."
     "$VENV_PYTHON" "$PROJECT_LOCAL_ROOT/scripts/drive/gestor_archivos_acq.py" &
-    ;;
 ```
-*Análisis*:
-1. Si `rsa-acelerografo.service` fue detenido remotamente mediante una orden MQTT de contingencia, `registrocontinuo start` lo vuelve a encender incondicionalmente a los 30 segundos de la siguiente hora.
-2. `gestor_archivos_acq.py &` se despacha en segundo plano **sin esperar a que termine** y **sin verificar si ya existe un proceso previo en ejecución**.
-3. Al acumularse 761 archivos pendientes, cada corrida tarda mucho más de 60 minutos, provocando que múltiples instancias de `gestor_archivos_acq.py` se ejecuten en paralelo.
+*Análisis del Acoplamiento*:
+1. `binary_to_mseed.py` corre primero y tarda $<5$ segundos en empaquetar la hora.
+2. `gestor_archivos_acq.py &` se lanza en segundo plano sin esperar finalización ni verificar duplicados.
+3. Ante fallos de DNS, cada archivo agota 5 reintentos de conexión fallida:
+   ```text
+   2026-10-02 17:01:45,449 - CHA2_gestor_acq.log - INFO - [ERROR] | error=Error en intento 5/5 subiendo CHA2_20261002_150000.mseed. Codigo: Unable to find the server at www.googleapis.com
+   ```
+4. Con 60 archivos en cola, el script tarda $>45$ minutos reintentando. Cuando llega el minuto `0` de la hora siguiente, el cron dispara otro proceso igual, multiplicando exponencialmente el consumo de RAM.
 
 ---
 
-### 3.4. Cronología del Incidente
+### 3.4. Mecanismo de Duplicación Masiva en Google Drive y Fallo de Registro
+Antes del saneamiento, se observaron **hasta 9 copias duplicadas del mismo archivo** en Google Drive.
+* **Causa**: Google Drive indexa archivos por `id` interno y permite nombres repetidos en un directorio. Nueve instancias concurrentes leyeron el inventario local simultáneamente e insertaron el mismo archivo MiniSEED en Drive.
+* **Fallo de Registro**:
+  - `drive_status_manager.py` aplica escrituras atómicas (`os.replace` de `.tmp` a `.json`). Cuando múltiples procesos compiten por reemplazar el archivo, la última instancia sobrescribe las actualizaciones de las anteriores.
+  - Además, el archivo `uploaded_files_registry.json` presentaba propiedad `root:root` (`-rw-r--r--`), lo que generaba `PermissionError` silencioso cuando el gestor corría bajo el usuario `rsa`.
 
-1. **2026-09-23**: En la red corporativa de las estaciones `CHA01` y `CHA02`, el servidor DNS interno (`192.170.100.250`) pierde la resolución de dominios del ecosistema Google (`*.google.com`, `*.googleapis.com`), mientras que `pool.ntp.org` y `github.com` se mantienen operativos.
-2. **2026-09-23 a 2026-09-28**: Las subidas a Google Drive fallan con `Unable to find the server at www.googleapis.com` o cuota de almacenamiento llena. La política de retención y protección de archivos retiene en disco todos los MiniSEED horarios y eventos extraídos generados, acumulando **761 archivos ($\approx 2.6\text{ GB}$)** en `CHA02`.
-3. **2026-09-29 mañana**: Se restablece el acceso a Internet o la cuota en Drive. El gestor de archivos comienza a transmitir la cola acumulada de forma ininterrumpida.
-4. **2026-09-29 15:30**: La memoria RAM de `CHA02` alcanza el 98.5%. El usuario emite vía MQTT el comando `stop_acquisition_safety`, logrando una descompresión temporal del 2% (RAM desciende a 96.5%).
-5. **2026-09-29 16:00:30**: El cron horario ejecuta `registrocontinuo start`. Revive `rsa-acelerografo.service`, ejecuta `binary_to_mseed.py` y lanza una nueva instancia concurrente de `gestor_archivos_acq.py &`. La memoria trepa a 97.7% - 100%, congelando `sshd` e induciendo *swap thrashing*.
-6. **2026-09-29 17:40**: Se ejecuta la maniobra de enviar la carpeta de Google Drive a la Papelera desde la nube. Las llamadas a la API de Drive fallan en 0.1 s sin transmitir bytes. Los sockets TCP 22 y 5000 pasan a responder `ABIERTO` en red local, pero el livelock acumulado en el kernel impide completar la autenticación interactiva.
+---
+
+### 3.5. Cronología Integral del Incidente
+
+| Fecha / Hora | Evento | Impacto Técnico |
+|---|---|---|
+| **2026-09-23** | Servidor DNS corporativo `192.170.100.250` pierde resolución de dominios Google. | Fallo intermitente de subidas en `CHA01` y `CHA02`. |
+| **2026-09-23/28** | Acumulación de 2,066 archivos locales (768 continuous mseed y 1,298 eventos extraídos, ~2.65 GB). | Retención local previene borrado, pero satura inventario. |
+| **2026-09-29 16:00** | Crontab horario lanza múltiples instancias concurrentes de `gestor_archivos_acq.py &`. | Livelock de RAM (98.5% -> 100%), swap thrashing y bloqueo de `sshd`. |
+| **2026-09-30** | Mitigación remota: envío de carpeta de Drive a Papelera y comando MQTT de parada. | Puertos TCP 22/5000 responden SYN-ACK, pero persistencia de livelock exige reinicio físico. |
+| **2026-10-01 16:07** | Intervención presencial: ciclo de energía físico completado en `CHA02`. | Sistema arranca nominal: CPU 1.68->0.56, Temp 48.9°C, RAM 233 MiB, sensor nominal. |
+| **2026-10-01 17:00** | Vaciado accidental de la papelera en Google Drive por un operador. | Carpeta destino eliminada permanentemente en la nube. |
+| **2026-10-01 18:02** | Creación de nuevas carpetas y despliegue de `evacuacion_controlada_drive.py`. | **1,934 archivos subidos exitosamente** con cerrojo `flock` y pausas controladas. |
+| **2026-10-01 20:40** | Poda automática de retención temporal: 131 archivos expirados purgados. | Espacio libre en disco se recupera a **7.8 GB (72% de uso)**. |
+| **2026-10-02 17:01** | Nuevos archivos horarios (15:00 y 16:00 UTC) fallan por DNS corporativo. | Dos archivos retenidos con error `Unable to find the server at www.googleapis.com`. |
+| **2026-10-02 18:00** | Diagnóstico confirma falla en `192.170.100.250`. Se pausa cron horario como precaución. | Estación queda protegida de livelock, pero se suspende conversión horaria de miniSEED. |
 
 ---
 
 ## 4. Hallazgos y Causa Raíz
 
-### Hallazgo 1: Falta de Exclusión Mutua (*File Lock*) en `gestor_archivos_acq.py`
-* **Descripción técnica**: Múltiples instancias del gestor de sincronización de Google Drive corren simultáneamente cuando el tiempo de transferencia excede la cadencia de invocación del cron (1 hora).
-* **Causa**: [`gestor_archivos_acq.py`](file:///home/rsa/git/montajes/acelerografo-DEV00/scripts/operation/drive/gestor_archivos_acq.py) no implementa bloqueo por archivo (*flock*) ni comprobación de PID existente al inicio del script.
-* **Condiciones de activación**: Ocurre siempre que haya un backlog sustancial de archivos acumulados (por caída de red, DNS o cuota de Drive) que demore el ciclo de subida más de 60 minutos.
+### Hallazgo 1: Falta de Exclusión Mutua (*File Lock*) en Procesos de Sincronización
+* **Causa**: Ausencia de cerrojo a nivel de sistema operativo (`fcntl.flock`) al iniciar `gestor_archivos_acq.py`.
+* **Efecto**: Acumulación descontrolada de instancias concurrentes ejecutadas por `cron`.
 
-### Hallazgo 2: Reactivación Incondicional de Servicios por `registrocontinuo.sh`
-* **Descripción técnica**: Los comandos de parada de seguridad o contingencia administrativa son anulados a cada hora en punto.
-* **Causa**: La lógica de `registrocontinuo.sh` evalúa `systemctl is-active rsa-acelerografo.service` e inicia el servicio si está inactivo, sin verificar si existe una bandera de parada intencional o mantenimiento (`/var/run/acq_maintenance.flag`).
-* **Condiciones de activación**: Invocación horaria desatendida por el daemon `cron`.
+### Hallazgo 2: Detección Falsa de Internet por Evaluación Exclusiva a Nivel IP
+* **Causa**: `check_internet_connection()` evalúa socket a `8.8.8.8:53`.
+* **Efecto**: Retorna `True` en redes con enrutamiento IP pero sin resolución de nombres, atrapando al gestor en bucles masivos de reintentos con timeouts de DNS.
 
-### Hallazgo 3: *Bufferbloat* y Asfixia del Canal de Red por Cola Masiva
-* **Descripción técnica**: La subida secuencial e ininterrumpida de 761 archivos MiniSEED ($\approx 2.6\text{ GB}$) saturó el buffer de salida de la Raspberry Pi hacia el router corporativo.
-* **Causa**: Ausencia de limitación de tasa (*rate limiting*) o procesamiento por lotes acotados (*batch limit*) en `subir_archivo.py`. Cada archivo abre sockets HTTPS pesados con timeouts de hasta 300 segundos.
-* **Condiciones de activación**: Reanudación de la conectividad tras períodos prolongados de retención local.
+### Hallazgo 3: Acoplamiento Indebido entre Conversión Local y Subida a Drive
+* **Causa**: `registrocontinuo.sh` empaqueta en una misma secuencia sincrónica/asincrónica la conversión `binary_to_mseed.py` y la subida `gestor_archivos_acq.py`.
+* **Efecto**: Al detener el cron para proteger la RAM ante caídas de Drive, se detiene colateralmente la generación de archivos miniSEED horarios.
 
-### Hallazgo 4: Livelock por Memoria (*Swap Thrashing*) en Arquitectura de 1 GB de RAM
-* **Descripción técnica**: Cuando la memoria disponible desciende por debajo de `vm.min_free_kbytes` ($\approx 15\text{ MB}$), el kernel gasta casi todos los ciclos de CPU intercambiando páginas de memoria con la tarjeta microSD lenta.
-* **Causa**: Los daemons de Supervisor (`gpd_worker` con IA, `stream_processor` y `mqtt_coordinator`) mantienen un consumo pasivo alto ($\approx 85\% - 90\%$). Al agregarse dos instancias de Python de 60 MB cada una, la RAM física se agota por completo.
-* **Condiciones de activación**: Tiempo de actividad (*uptime*) prolongado (>8 días) con acumulación de memoria en heap de Python sumado a sobrecarga horaria.
+### Hallazgo 4: Ausencia de *Fail-Fast* en Ciclos de Subida
+* **Causa**: Si el primer archivo falla por error de DNS o red inalcanzable, el gestor no aborta el ciclo; continúa iterando los restantes $N$ archivos pendientes ejecutando 5 reintentos por cada uno.
+* **Efecto**: Un lote con 50 archivos pendientes consume más de 50 minutos de CPU y sockets inútilmente.
 
----
-
-## 5. Evaluación de Riesgo
-
-| # | Escenario de Riesgo | Probabilidad | Impacto | Mitigación Requerida |
-|---|---|---|---|---|
-| **R1** | Recurrencia en estaciones de campo remotas (`CHA01`, `PNS01`, `TEST`) ante cortes de enlace de Drive. | **Alta** | **Crítico** | Implementar `fcntl.flock` inmediato en `gestor_archivos_acq.py`. |
-| **R2** | Desgaste prematuro o corrupción de la tarjeta microSD por escritura continua en swap durante livelock. | **Media** | **Alto** | Configurar límites estrictos de swapiness y watchdog de memoria. |
-| **R3** | Saturación del enlace WAN corporativo por ráfagas ininterrumpidas de MiniSEED afectando otros servicios de red. | **Alta** | **Medio** | Dosificación por lotes (*batch size max = 10 archivos/hora*). |
-| **R4** | Imposibilidad de reiniciar remotamente estaciones colgadas sin acceso físico. | **Media** | **Crítico** | Añadir handler MQTT nativo `cmd/reboot_system` en `mqtt_coordinator.py`. |
+### Hallazgo 5: Livelock por Memoria (*Swap Thrashing*) en Arquitectura de 1 GB de RAM
+* **Causa**: Daemons de Supervisor consumen base de 350-400 MiB; cada instancia de Python de Drive retiene 40-60 MiB. Múltiples instancias saturan la memoria física forzando swap en microSD lenta y bloqueando llamadas `fork()` de `sshd`.
 
 ---
 
-## 6. Opciones y Decisiones de Arquitectura
+## 5. Mitigaciones Temporales Implementadas
 
-### Decisión 1: Control de Concurrencia en la Sincronización a Google Drive
+### Mitigación 1: Script de Evacuación Controlada (`evacuacion_controlada_drive.py`)
+Para subsanar el colapso sin riesgo de saturar la memoria ni la red celular, se desarrolló y ejecutó en `CHA02` el script `/home/rsa/projects/acelerografo/scripts/drive/evacuacion_controlada_drive.py`:
+* **Cerrojo Atómico**: Implementación de `fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)` sobre `/tmp/evacuacion_drive.lock`.
+* **Inmunidad a Desconexión SSH**: Manejo de señales con `signal.signal(signal.SIGHUP, signal.SIG_IGN)` y ejecución con `nohup`.
+* **Priorización Científica de Datos**: Primero evacuación de 1,283 eventos sísmicos extraídos (145 MB en total) y posteriormente 651 archivos continuos MiniSEED (2.5 GB).
+* **Control de Tráfico (*Anti-Bufferbloat*)**: Pausa deliberada de 1.5 segundos entre archivos.
+* **Recolección Forzada de Basura**: Invocación de `gc.collect()` cada 25 archivos, manteniendo la huella de RAM fija en ~35 MiB.
+* **Resultado**: **1,934 archivos subidos exitosamente** en una sola noche y espacio en disco liberado a 7.8 GB.
 
-| Opción | Descripción | Ventajas | Desventajas |
-|---|---|---|---|
-| **A: File Lock Atómico en Python (`fcntl.flock`)** | Bloquear un archivo testigo (`/tmp/gestor_acq.lock`) en modo no bloqueante (`LOCK_EX \| LOCK_NB`). Si ya está bloqueado, salir con `sys.exit(0)`. | • Robusto y autocontenido.<br>• El lock se libera automáticamente si el proceso muere o cae por OOM.<br>• Cero dependencias externas. | Ninguna relevante. |
-| **B: Validación de proceso por shell (`pgrep`) en `registrocontinuo.sh`** | Usar `pgrep -f gestor_archivos_acq.py` antes de ejecutar la línea con `&`. | • No requiere tocar el script de Python. | Vulnerable a condiciones de carrera y no protege si el gestor se ejecuta desde otra vía. |
+### Mitigación 2: Gestión de IDs de Google Drive
+Tras el vaciado de la papelera en Drive:
+* Creación de nuevas carpetas dedicadas para `mseed` y `eventos`.
+* Actualización de `mseed_id` y `events_id` en `configuracion_dispositivo.json`.
+* Saneamiento y corrección de permisos en `uploaded_files_registry.json` para el usuario `rsa`.
 
-> **Recomendación**: **Implementar Opción A como mecanismo primario** en `gestor_archivos_acq.py` reforzada con **Opción B** en `registrocontinuo.sh`.
-
----
-
-### Decisión 2: Política de Evacuación de Colas Masivas (Store & Forward Dosificado)
-
-| Opción | Descripción | Ventajas | Desventajas |
-|---|---|---|---|
-| **A: Lote Acotado por Corrida (`max_batch_size`)** | Subir como máximo $N$ archivos (ej. 10 archivos continuos + 5 eventos) por cada ciclo horario. | • Evita saturar la memoria y el ancho de banda.<br>• Garantiza que la ejecución termine en menos de 10 minutos.<br>• Deja el sistema libre para SSH y telemetría. | La cola grande tarda varios días en evacuarse por completo. |
-| **B: Subida Continua Exhaustiva (Actual)** | Intentar subir todos los archivos pendientes en un único bucle hasta agotar la cola. | • Si la red es veloz, vacía la cola más rápido. | Provoca colapso de memoria y red si la cola supera los 50 archivos. |
-
-> **Recomendación**: **Adoptar Opción A** configurando `max_batch_size: 15` en `configuracion_dispositivo.json`.
-
----
-
-## 7. Mitigaciones Aplicadas Durante la Sesión
-
-1. **Detención Parcial vía Telemetría MQTT**:
-   * Se emitió la orden `cmd/stop_acquisition_safety` hacia `CHA02`, la cual ejecutó `sudo systemctl stop rsa-acelerografo.service`, logrando una descompresión inmediata del 2% de RAM (de 98.5% a 96.5%).
-2. **Contención del Flujo de Datos en Google Drive (Nube)**:
-   * Se trasladó temporalmente la carpeta de destino de `CHA02` en Google Drive a la **Papelera**.
-   * Esto provocó que las peticiones de subida de la API fallaran de forma instantánea ($<100\text{ ms}$) sin transferir datos masivos, cortando la saturación de subida (*uplink*) y logrando que los sockets TCP de los puertos 22 y 5000 volvieran a reportar estado `ABIERTO` en pruebas de red local desde `concentrador-CON00`.
-3. **Planificación de Intervención Presencial**:
-   * Ante la irreversibilidad del livelock de memoria en los procesos del espacio de usuario, se programó visita presencial a la estación para la semana entrante para realizar un ciclo de energía físico limpio (*power cycle*).
+### Mitigación 3: Política de Espera Prudencial de Red y Pausa de Cron
+* **Respeto a la Gobernanza de Red Corporativa**: Se desestimó alterar manualmente `/etc/resolv.conf` con DNS públicos (8.8.8.8 / 1.1.1.1) para cumplir con las políticas institucionales de TI y evitar conflictos de firewall.
+* **Autonomía Local Verificada**: Con 7.8 GB libres en disco y una tasa de generación de ~82 MB/día, la estación tiene capacidad de almacenamiento autónomo local de **más de 90 días**. Los datos no se pierden y quedan retenidos de forma segura.
+* **Pausa de Cron**: Desactivación temporal de la línea horaria en `crontab -e` de `CHA02` para impedir acumulación de procesos mientras el DNS corporativo continúe inestable.
 
 ---
 
-## 8. Backlog de Mejoras Técnicas
+## 6. Hoja de Ruta para Planificación Definitiva (Hacia el Blueprint)
 
-1. **Incorporación de Mutex / Lock Atómico (`gestor_archivos_acq.py`)**:
-   Implementar al inicio de la función principal `main()`:
-   ```python
-   import fcntl, sys
-   lock_file = open('/tmp/gestor_archivos_acq.lock', 'w')
-   try:
-       fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-   except BlockingIOError:
-       logger.warning("[SKIP] Ya existe otra instancia de gestor_archivos_acq en ejecución. Saliendo.")
-       sys.exit(0)
-   ```
-2. **Control de Lote Máximo (*Batch Limit*)**:
-   Limitar la lista de archivos a procesar por ciclo en `gestor_archivos_acq.py`:
-   `archivos_a_subir = archivos_pendientes[:max_batch_files]`.
-3. **Bandera de Mantenimiento en `registrocontinuo.sh`**:
-   No iniciar `rsa-acelerografo.service` si existe el archivo de bloqueo `/var/run/acq_stop.flag` creado por el comando MQTT `stop_acquisition_safety`.
-4. **Comando MQTT de Reinicio de Emergencia (`cmd/reboot_system`)**:
-   Registrar en `CommandDispatcher` de [`mqtt_coordinator.py`](file:///home/rsa/git/montajes/acelerografo-DEV00/scripts/operation/mqtt/mqtt_coordinator.py):
-   ```python
-   def _cmd_reboot_system(self, payload: dict, client) -> dict:
-       subprocess.Popen(["sudo", "/sbin/reboot", "-f"])
-       return {"status": "accepted", "action": "reboot_system"}
-   ```
-5. **Watchdog de Memoria en Supervisor / Systemd**:
-   Script o servicio periódico que monitoree el porcentaje de RAM disponible; si supera el 95% de forma sostenida por más de 15 minutos, ejecute una purga de caches (`drop_caches`) o reinicio programado de daemons secundarios.
+Con base en la caracterización completa de estas fallas, se define la hoja de ruta técnica que deberá estructurarse formalmente en un **Blueprint de Planificación** (`docs/blueprints/`):
 
----
+### Fase 1: Desacoplamiento de Tareas en `registrocontinuo.sh`
+* Separar la conversión `binary_to_mseed.py` del proceso de sincronización con Google Drive.
+* La conversión horaria debe ejecutarse de forma independiente y garantizada a cada hora, independientemente del estado de la red o de Drive.
+* Incorporar verificación de proceso activo (`pgrep`) previo a cualquier invocación en segundo plano.
 
-## 9. Dependencias y Prerrequisitos para la Intervención
+### Fase 2: Blindaje y Exclusión Mutua en `gestor_archivos_acq.py`
+* Migrar formalmente el cerrojo atómico `fcntl.flock` al inicio de `gestor_archivos_acq.py`.
+* Si existe un cerrojo activo, el script debe registrar un aviso limpio y salir inmediatamente con código 0.
 
-| Prerrequisito | Estado | Acción Requerida |
-|---|---|---|
-| **Acceso Físico a la Estación `CHA02`** | ⬜ Programado | Visita presencial planificada para la próxima semana por el operador. |
-| **Reinicio Físico Limpio** | ⬜ Pendiente | Desconectar y reconectar alimentación para evacuar la memoria RAM y swap. |
-| **Restauración de Carpeta en Google Drive** | ⬜ Pendiente | Restaurar la carpeta `CHA02` de la papelera una vez reiniciada la estación. |
-| **Desactivación Preventiva del Cron** | ⬜ Por ejecutar | Comentar temporalmente la línea horaria de `crontab -e` tras arrancar para evitar saturación antes de desplegar mejoras. |
+### Fase 3: Validación Real de DNS y Mecanismo *Fail-Fast*
+* Reemplazar la prueba ciega a `8.8.8.8:53` en `check_internet_connection()` por una verificación de resolución de dominio:
+  ```python
+  socket.getaddrinfo("www.googleapis.com", 443, timeout=5)
+  ```
+* Implementar aborto temprano (*fail-fast*): si la autenticación o la subida del primer archivo falla por resolución de red/DNS, abortar el ciclo de subida completo sin iterar el resto de la cola.
+
+### Fase 4: Dosificación por Lotes (*Batch Limiting*) y Pacing de Red
+* Incorporar parámetro configurable `max_batch_size` (ej. 15-20 archivos por corrida) en `configuracion_dispositivo.json`.
+* Mantener una pausa breve (1 a 1.5s) entre transferencias para proteger el enlace celular y preservar la telemetría MQTT.
+
+### Fase 5: Watchdog y Despliegue en Flota (`CHA01`, `CHA02`)
+* Sincronizar y validar la solución en `CHA01` (previniendo sus picos de RAM actuales) y `CHA02`.
+* Incorporar en la telemetría MQTT métricas sobre archivos en cola y estado de resolución DNS.
 
 ---
 
-## 10. Plan de Validación Post-Reinicio
+## 7. Referencias y Documentos Relacionados
 
-| # | Checkpoint | Criterio de Éxito |
-|---|---|---|
-| **CP-1** | Arranque del Sistema Operativo | RAM utilizada $< 35\%$ tras reinicio (`free -m`). |
-| **CP-2** | Acceso SSH Restaurado | Conexión interactiva inmediata sin timeouts vía `ssh CHA02`. |
-| **CP-3** | Telemetría MQTT Reactivada | Recepción de latido `online` y métricas `telemetry/health` en broker. |
-| **CP-4** | Adquisición SPI Nominal | `systemctl status rsa-acelerografo` en estado `active (running)` y generación de tramas. |
-| **CP-5** | Evacuación Dosificada a Drive | Subida escalonada de los 761 archivos pendientes sin picos de RAM superiores al 60%. |
+* [`docs/adr/021_sincronizacion_espejo_registro_drive_y_sintesis_diagnostico.md`](file:///home/rsa/git/montajes/acelerografo-DEV00/docs/adr/021_sincronizacion_espejo_registro_drive_y_sintesis_diagnostico.md): Sincronización espejo del registro de Drive con almacenamiento local.
+* [`scripts/drive/evacuacion_controlada_drive.py`](file:///home/rsa/git/montajes/acelerografo-DEV00/scripts/drive/evacuacion_controlada_drive.py): Script de contingencia con exclusión mutua y control de recursos.
+* [`scripts/task/diagnostico.sh`](file:///home/rsa/git/montajes/acelerografo-DEV00/scripts/task/diagnostico.sh): Rutina de diagnóstico integral de la estación.
+* [`scripts/task/registrocontinuo.sh`](file:///home/rsa/git/montajes/acelerografo-DEV00/scripts/task/registrocontinuo.sh): Orquestador horario de adquisición, conversión y subida.
