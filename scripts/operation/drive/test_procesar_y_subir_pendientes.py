@@ -245,6 +245,66 @@ class TestProcesarYSubirPendientes(unittest.TestCase):
         self.assertIsNotNone(lock3)
         psp.liberar_cerrojo(lock3)
 
+    # ------------------------------------------------------------------------
+    # 6. Pruebas de Cupo Dinámico y Retro-presión (DEV0)
+    # ------------------------------------------------------------------------
+    @patch("procesar_y_subir_pendientes.procesar_archivo_individual")
+    @patch("procesar_y_subir_pendientes.extraer_tiempo_binario")
+    @patch("procesar_y_subir_pendientes.nombrar_archivo_mseed")
+    def test_convertir_archivos_pendientes_con_cupo_maximo(
+        self, mock_nombrar, mock_extraer, mock_procesar
+    ):
+        """Verifica que max_convertir detiene la conversión al alcanzar el cupo solicitado."""
+        for i in range(5):
+            f = os.path.join(self.rc_dir, f"DEV00_261013-0{i}0000.dat")
+            with open(f, "wb") as fh:
+                fh.write(b"\x00" * 2506)
+
+        mock_nombrar.side_effect = lambda est, t: f"DEV0_20261013_fake_{t['hora']}.mseed"
+        mock_extraer.side_effect = lambda f, u: {"anio": 2026, "mes": 10, "dia": 13, "hora": int(f[-10:-8]), "minuto": 0, "segundo": 0}
+        mock_procesar.return_value = (True, "OK", {"tiempo_lectura": 0.1})
+
+        resumen = psp.convertir_archivos_pendientes(
+            path_registro_continuo=self.rc_dir,
+            path_archivos_mseed=self.ms_dir,
+            codigo_estacion="DEV0",
+            config_mseed={"CODIGO(1)": "DEV0"},
+            archivos_activos=set(),
+            logger=MagicMock(),
+            max_convertir=2,
+            dry_run=False
+        )
+
+        self.assertEqual(resumen["total_dat"], 5)
+        self.assertEqual(resumen["convertidos_exitosos"], 2)
+        self.assertEqual(mock_procesar.call_count, 2)
+
+    def test_obtener_cola_subida_drive_prioridades(self):
+        """Verifica que obtener_cola_subida_drive lista eventos primero y luego miniSEED horarios."""
+        f_ev = os.path.join(self.ev_dir, "DEV0_evento_1.mseed")
+        f_ms = os.path.join(self.ms_dir, "DEV0_continuo_1.mseed")
+        for f in [f_ev, f_ms]:
+            with open(f, "wb") as fh:
+                fh.write(b"DATA")
+
+        config_disp = {
+            "directorios": {
+                "archivos_mseed": self.ms_dir,
+                "eventos_extraidos": self.ev_dir
+            },
+            "drive": {
+                "carpetas": {
+                    "mseed_id": "DRIVE_MSEED_ID_DEV0",
+                    "events_id": "DRIVE_EVENTS_ID_DEV0"
+                }
+            }
+        }
+
+        cola = psp.obtener_cola_subida_drive(config_disp, self.log_dir)
+        self.assertEqual(len(cola), 2)
+        self.assertEqual(cola[0][2], "event")
+        self.assertEqual(cola[1][2], "mseed")
+
 
 # ============================================================================
 # 6. RUNNER COMPATIBLE CON FORMATO DE TEST_GESTOR_EVENTOS.PY Y UNITTEST
