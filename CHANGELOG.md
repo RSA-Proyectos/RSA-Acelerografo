@@ -6,6 +6,26 @@ El formato se basa en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/
 
 ---
 
+## [v4.5.3] — 2026-10-13
+
+### Añadido
+- **Recuperación y Subida Desacoplada de Archivos Pendientes (`procesar_y_subir_pendientes.py`)**:
+  - Procesamiento secuencial en dos fases independientes (conversión local `.dat` a `.mseed` y subida a Google Drive).
+  - Protección automática del archivo binario actualmente en grabación SPI para evitar corrupción.
+  - Idempotencia total: omisión instantánea de archivos `.dat` que ya cuenten con su archivo `.mseed` generado.
+  - Verificación previa de conectividad DNS con socket probe a Google (timeout 5s) antes de iniciar transferencias.
+  - Soporte de banderas por CLI (`--dry-run`, `--limit`, `--skip-conversion`, `--skip-upload`).
+- **Wrapper Ejecutable de Sistema (`/usr/local/bin/procesarpendientes`)**:
+  - Script bash `procesarpendientes.sh` que garantiza la invocación automática dentro del entorno virtual Python (`.venv`).
+- **Suite de Pruebas Unitarias (`test_procesar_y_subir_pendientes.py`)**:
+  - Cobertura completa de casos de uso (protección de archivo activo, omisión por idempotencia y fallo controlado de DNS).
+
+### Corregido
+- **Blindaje de Permisos en `update.sh`**:
+  - Aplicación incondicional de `chown -R` y `chmod -R u+rwX` sobre `PROJECT_LOCAL_ROOT` y `log-files/` asignados al usuario operativo (`rsa`), erradicando bloqueos por `PermissionError`.
+
+---
+
 ## [v4.5.2] — 2026-09-21
 
 ### Añadido
