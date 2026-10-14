@@ -6,6 +6,23 @@ El formato se basa en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/
 
 ---
 
+## [v4.5.4] — 2026-10-14
+
+### Añadido
+- **Control de Flujo y Retro-presión en `procesar_y_subir_pendientes.py`**:
+  - Comprobación previa de resolución DNS hacia Google Drive (*fail-fast*): cancela el ciclo preventivamente sin generar archivos `.mseed` huérfanos si la red no está operativa.
+  - Sincronización 1:1 entre el tamaño de lote (`--batch-size`) y los archivos pendientes en disco: omite conversiones innecesarias si la cola ya tiene suficientes archivos esperando subida.
+  - Parámetro `max_convertir` para acotar la conversión local al cupo estricto del lote.
+- **Políticas de Liberación de Almacenamiento en Campo**:
+  - Bandera `--delete-uploaded`: Elimina el archivo `.mseed` o evento local inmediatamente después de que Google Drive confirma recepción con éxito HTTP 200 y registro atómico.
+  - Bandera `--purge-dat`: Fase 3 que elimina archivos binarios `.dat` históricos cuyo `.mseed` equivalente ya consta como subido en `uploaded_files_registry.json`.
+  - Salvaguarda incondicional que protege el archivo `.dat` en grabación activa por el dsPIC33 y preserva los binarios aún no respaldados en la nube.
+- **Ampliación de Pruebas Unitarias (`test_procesar_y_subir_pendientes.py`)**:
+  - Casos de prueba para cupo dinámico de conversión, delegación de borrado post-subida y purga selectiva de binarios respaldados.
+
+
+---
+
 ## [v4.5.3] — 2026-10-13
 
 ### Añadido
