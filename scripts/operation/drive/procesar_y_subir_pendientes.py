@@ -185,11 +185,13 @@ def convertir_archivos_pendientes(
     archivos_activos,
     logger,
     usar_fecha_filename=False,
+    max_convertir=None,
     dry_run=False
 ):
     """
     Convierte secuencialmente archivos binarios .dat no convertidos a .mseed.
     Es 100% idempotente: si el .mseed ya existe en disco, se omite de inmediato.
+    Si se especifica max_convertir (int), se detiene al alcanzar dicho cupo.
     """
     resumen = {
         "total_dat": 0,
@@ -211,7 +213,15 @@ def convertir_archivos_pendientes(
     archivos_dat = sorted(glob.glob(os.path.join(path_registro_continuo, "*.dat")))
     resumen["total_dat"] = len(archivos_dat)
 
+    if max_convertir is not None and max_convertir <= 0:
+        return resumen
+
     for binary_file in archivos_dat:
+        # Control de retro-presión: detener si se completó el cupo asignado
+        if max_convertir is not None and resumen["convertidos_exitosos"] >= max_convertir:
+            print(f"\n  [CUPO ALCANZADO] Se completó el cupo de conversión ({max_convertir} archivo(s)).")
+            break
+
         binary_filename = os.path.basename(binary_file)
 
         # 1. Proteger archivo activo
@@ -282,6 +292,40 @@ def verificar_dns_drive(host="www.googleapis.com", port=443, timeout=5):
         return False
 
 
+def obtener_cola_subida_drive(config_dispositivo, log_directory):
+    """
+    Construye la lista ordenada de archivos miniSEED y eventos en disco
+    pendientes de subir a Google Drive, priorizando eventos sísmicos.
+    Retorna una lista de tuplas: (f_path, fname, tipo, folder_id).
+    """
+    cola = []
+    drive_config = config_dispositivo.get("drive", {})
+    carpetas_drive = drive_config.get("carpetas", {})
+    mseed_id = carpetas_drive.get("mseed_id", "")
+    events_id = carpetas_drive.get("events_id", "")
+
+    path_mseed = config_dispositivo.get("directorios", {}).get("archivos_mseed", "")
+    path_eventos = config_dispositivo.get("directorios", {}).get("eventos_extraidos", "")
+
+    # Prioridad 1: Eventos sísmicos extraídos
+    if path_eventos and os.path.isdir(path_eventos) and events_id:
+        archivos_ev = sorted(glob.glob(os.path.join(path_eventos, "*.*")), key=os.path.getmtime)
+        for f_path in archivos_ev:
+            fname = os.path.basename(f_path)
+            if fname.endswith((".mseed", ".dat")) and not ya_fue_subido(log_directory, fname, "event"):
+                cola.append((f_path, fname, "event", events_id))
+
+    # Prioridad 2: Archivos continuos miniSEED
+    if path_mseed and os.path.isdir(path_mseed) and mseed_id:
+        archivos_ms = sorted(glob.glob(os.path.join(path_mseed, "*.mseed")), key=os.path.getmtime)
+        for f_path in archivos_ms:
+            fname = os.path.basename(f_path)
+            if not ya_fue_subido(log_directory, fname, "mseed"):
+                cola.append((f_path, fname, "mseed", mseed_id))
+
+    return cola
+
+
 def subir_archivos_pendientes(
     local_root,
     config_dispositivo,
@@ -289,11 +333,14 @@ def subir_archivos_pendientes(
     logger,
     batch_size=20,
     all_files=False,
+    dns_verificado=False,
+    delete_uploaded=False,
     dry_run=False
 ):
     """
     Sube archivos miniSEED y eventos pendientes a Google Drive con control de lotes,
     espaciado anti-bufferbloat y aborto temprano (fail-fast) ante caídas de DNS.
+    Si delete_uploaded=True, borra localmente el archivo tras confirmar subida a Drive.
     """
     resumen = {
         "status": "ok",
@@ -304,8 +351,8 @@ def subir_archivos_pendientes(
         "detalles_fallidos": []
     }
 
-    # 1. Comprobación real de resolución DNS
-    if not verificar_dns_drive():
+    # 1. Comprobación real de resolución DNS (si no fue validada previamente)
+    if not dns_verificado and not verificar_dns_drive():
         resumen["dns_ok"] = False
         resumen["status"] = "dns_unreachable"
         msg = (
@@ -320,12 +367,6 @@ def subir_archivos_pendientes(
 
     # 2. Rutas e IDs de Drive
     drive_config = config_dispositivo.get("drive", {})
-    carpetas_drive = drive_config.get("carpetas", {})
-    mseed_id = carpetas_drive.get("mseed_id", "")
-    events_id = carpetas_drive.get("events_id", "")
-
-    path_mseed = config_dispositivo.get("directorios", {}).get("archivos_mseed", "")
-    path_eventos = config_dispositivo.get("directorios", {}).get("eventos_extraidos", "")
 
     # 3. Autenticación con Google Drive
     credentials_file = os.path.join(local_root, "configuracion", "drive_credentials.json")
@@ -341,23 +382,7 @@ def subir_archivos_pendientes(
             return resumen
 
     # 4. Construir cola de archivos pendientes (priorizando eventos)
-    cola_subida = []
-
-    # Prioridad 1: Eventos sísmicos extraídos
-    if path_eventos and os.path.isdir(path_eventos) and events_id:
-        archivos_ev = sorted(glob.glob(os.path.join(path_eventos, "*.*")), key=os.path.getmtime)
-        for f_path in archivos_ev:
-            fname = os.path.basename(f_path)
-            if fname.endswith((".mseed", ".dat")) and not ya_fue_subido(log_directory, fname, "event"):
-                cola_subida.append((f_path, fname, "event", events_id))
-
-    # Prioridad 2: Archivos continuos miniSEED
-    if path_mseed and os.path.isdir(path_mseed) and mseed_id:
-        archivos_ms = sorted(glob.glob(os.path.join(path_mseed, "*.mseed")), key=os.path.getmtime)
-        for f_path in archivos_ms:
-            fname = os.path.basename(f_path)
-            if not ya_fue_subido(log_directory, fname, "mseed"):
-                cola_subida.append((f_path, fname, "mseed", mseed_id))
+    cola_subida = obtener_cola_subida_drive(config_dispositivo, log_directory)
 
     resumen["total_pendientes"] = len(cola_subida)
 
@@ -376,7 +401,8 @@ def subir_archivos_pendientes(
         prefijo = f"[{idx:02d}/{len(lote):02d}] ({tipo})"
 
         if dry_run:
-            print(f"  [DRY-RUN] {prefijo} Se subiría: {fname} a carpeta {folder_id}")
+            del_msg = " (y se eliminaría localmente)" if delete_uploaded else ""
+            print(f"  [DRY-RUN] {prefijo} Se subiría: {fname} a carpeta {folder_id}{del_msg}")
             resumen["subidos_exitosos"] += 1
             continue
 
@@ -389,7 +415,7 @@ def subir_archivos_pendientes(
             max_reintentos=max_reintentos,
             tiempo_espera=tiempo_espera,
             logger=logger,
-            borrar_despues=False,
+            borrar_despues=delete_uploaded,
             tipo_archivo=tipo,
             log_directory=log_directory
         )
@@ -397,7 +423,8 @@ def subir_archivos_pendientes(
         if exito:
             marcar_como_exitoso(log_directory, fname, tipo, logger=logger)
             resumen["subidos_exitosos"] += 1
-            print(" OK")
+            del_msg = " [ELIMINADO LOCAL]" if delete_uploaded else ""
+            print(f" OK{del_msg}")
             time.sleep(1.5)  # Espaciado anti-bufferbloat
             gc.collect()     # Liberación de memoria tras subida
         else:
@@ -412,6 +439,73 @@ def subir_archivos_pendientes(
                 logger.warning("[FAIL_FAST] Caída de DNS corporativo en lote. Abortando.")
                 resumen["status"] = "interrupted_by_dns_failure"
                 break
+
+    return resumen
+
+
+# ============================================================================
+# FASE 3: PURGA DE BINARIOS .DAT RESPALDADOS EN GOOGLE DRIVE
+# ============================================================================
+def purgar_binarios_respaldados(
+    path_registro_continuo,
+    codigo_estacion,
+    log_directory,
+    archivos_activos,
+    logger,
+    usar_fecha_filename=False,
+    dry_run=False
+):
+    """
+    Elimina archivos binarios .dat cuyo miniSEED correspondiente ya fue subido
+    exitosamente a Google Drive (confirmado en uploaded_files_registry.json).
+    Protege incondicionalmente el archivo activo en grabación SPI.
+    """
+    resumen = {
+        "total_evaluados": 0,
+        "purgados": 0,
+        "omitidos_activos": 0,
+        "omitidos_no_subidos": 0
+    }
+
+    if not os.path.isdir(path_registro_continuo):
+        logger.warning(f"Directorio de registro continuo no existe para purga: {path_registro_continuo}")
+        return resumen
+
+    archivos_dat = sorted(glob.glob(os.path.join(path_registro_continuo, "*.dat")))
+    resumen["total_evaluados"] = len(archivos_dat)
+
+    for binary_file in archivos_dat:
+        binary_filename = os.path.basename(binary_file)
+
+        # 1. Proteger incondicionalmente el archivo en grabación activa
+        if binary_filename in archivos_activos:
+            resumen["omitidos_activos"] += 1
+            continue
+
+        # 2. Extraer tiempo para determinar el nombre .mseed equivalente
+        tiempo_binario = extraer_tiempo_binario(binary_file, usar_fecha_filename)
+        if tiempo_binario is None:
+            # Archivo dañado o sin tiempo determinable: no purgar automáticamente
+            continue
+
+        mseed_filename = nombrar_archivo_mseed(codigo_estacion, tiempo_binario)
+
+        # 3. Verificar si el miniSEED ya consta como subido exitosamente en Drive
+        if ya_fue_subido(log_directory, mseed_filename, "mseed"):
+            if dry_run:
+                print(f"  [DRY-RUN] Se purgaría .dat respaldado: {binary_filename} (confirmado en Drive: {mseed_filename})")
+                resumen["purgados"] += 1
+            else:
+                try:
+                    os.remove(binary_file)
+                    resumen["purgados"] += 1
+                    logger.info(f"Binario .dat purgado tras confirmar subida a Drive: {binary_filename}")
+                    print(f"  [PURGADO] {binary_filename} (confirmado en Drive: {mseed_filename})")
+                except Exception as e:
+                    logger.error("purge_error", f"No se pudo eliminar {binary_filename}: {e}")
+                    print(f"  [ERROR AL PURGAR] {binary_filename}: {e}")
+        else:
+            resumen["omitidos_no_subidos"] += 1
 
     return resumen
 
@@ -448,6 +542,18 @@ def main():
         "--all",
         action="store_true",
         help="Procesa todos los archivos pendientes de subida sin límite de lote"
+    )
+    parser.add_argument(
+        "--delete-uploaded",
+        action="store_true",
+        default=False,
+        help="Elimina el archivo miniSEED/evento local inmediatamente tras confirmarse su subida a Drive"
+    )
+    parser.add_argument(
+        "--purge-dat",
+        action="store_true",
+        default=False,
+        help="Elimina archivos binarios .dat cuyo miniSEED ya consta como subido exitosamente a Drive"
     )
     parser.add_argument(
         "--verbosity",
@@ -508,12 +614,48 @@ def main():
         print(f"  Modo: {'[SIMULACIÓN DRY-RUN]' if args.dry_run else '[EJECUCIÓN REAL]'}")
         print("=" * 65)
 
-        # 3. FASE 1: Conversión Local de Binarios Pendientes
+        # 3. VERIFICACIÓN PREVIA DE DNS (FAIL-FAST)
+        dns_ok_previo = False
+        if not args.solo_convertir:
+            print("\n[VERIFICACIÓN PREVIA DNS] Comprobando conectividad con Google Drive...")
+            dns_ok_previo = verificar_dns_drive()
+            if not dns_ok_previo:
+                msg = (
+                    "[FAIL-FAST DNS] No es posible resolver 'www.googleapis.com'.\n"
+                    "El servidor DNS corporativo no responde o no resuelve dominios de Google.\n"
+                    "Aviso: Se omite la conversión y la subida para proteger el almacenamiento en disco y la RAM.\n"
+                    "Los archivos binarios .dat se mantienen resguardados localmente (>90 días de autonomía)."
+                )
+                print(f"  FALLÓ.\n\n{msg}\n")
+                logger.warning(msg)
+                print("=" * 65)
+                print("  Proceso finalizado preventivamente por indisponibilidad de DNS.")
+                print("=" * 65 + "\n")
+                return
+            print("  Resolución DNS: OK (servicios de Google disponibles).")
+
+        # 4. FASE 1: Conversión Local de Binarios Pendientes con Cupo Dinámico
         if not args.solo_subir:
             print("\n[FASE 1] Conversión Local de Archivos Binarios a miniSEED:")
             activos = obtener_archivos_activos(local_root, path_rc)
             if activos:
                 print(f"  Archivo(s) activo(s) en grabación protegidos: {', '.join(activos)}")
+
+            # Cálculo de retro-presión: sincronizar conversiones con archivos en cola de subida
+            max_a_convertir = None
+            if not args.all and args.batch_size > 0:
+                if args.solo_convertir:
+                    max_a_convertir = args.batch_size
+                    print(f"  [MODO SOLO CONVERSIÓN] Lote máximo a convertir: {max_a_convertir} archivo(s).")
+                else:
+                    cola_existente = obtener_cola_subida_drive(config_dispositivo, log_dir)
+                    num_existentes = len(cola_existente)
+                    max_a_convertir = max(0, args.batch_size - num_existentes)
+                    if max_a_convertir == 0:
+                        print(f"  [RETRO-PRESIÓN] Existen {num_existentes} archivo(s) .mseed/eventos en disco esperando subida.")
+                        print(f"  Se alcanza el límite del lote (--batch-size {args.batch_size}). Se omite conversión de nuevos .dat.")
+                    else:
+                        print(f"  [CUPO DINÁMICO] En cola de disco: {num_existentes}. Cupo a convertir: {max_a_convertir} (para lote de {args.batch_size}).")
 
             res_conv = convertir_archivos_pendientes(
                 path_registro_continuo=path_rc,
@@ -523,6 +665,7 @@ def main():
                 archivos_activos=activos,
                 logger=logger,
                 usar_fecha_filename=usar_fecha_filename,
+                max_convertir=max_a_convertir,
                 dry_run=args.dry_run
             )
 
@@ -533,7 +676,7 @@ def main():
             print(f"  Convertidos con éxito   : {res_conv['convertidos_exitosos']}")
             print(f"  Fallidos                : {res_conv['fallidos']}")
 
-        # 4. FASE 2: Subida Resiliente a Google Drive
+        # 5. FASE 2: Subida Resiliente a Google Drive
         if not args.solo_convertir:
             print("\n[FASE 2] Subida Controlada a Google Drive:")
             res_sub = subir_archivos_pendientes(
@@ -543,6 +686,8 @@ def main():
                 logger=logger,
                 batch_size=args.batch_size,
                 all_files=args.all,
+                dns_verificado=dns_ok_previo,
+                delete_uploaded=args.delete_uploaded,
                 dry_run=args.dry_run
             )
 
@@ -552,6 +697,25 @@ def main():
             print(f"  Subidos exitosamente   : {res_sub['subidos_exitosos']}")
             print(f"  Fallidos en lote       : {res_sub['subidos_fallidos']}")
             print(f"  Estado de finalización : {res_sub['status']}")
+
+        # 6. FASE 3: Purga de Binarios .dat Respaldados en Drive (si se solicita --purge-dat)
+        if args.purge_dat:
+            print("\n[FASE 3] Purga de Archivos Binarios .dat Respaldados en Google Drive:")
+            activos = obtener_archivos_activos(local_root, path_rc)
+            res_purge = purgar_binarios_respaldados(
+                path_registro_continuo=path_rc,
+                codigo_estacion=codigo_estacion,
+                log_directory=log_dir,
+                archivos_activos=activos,
+                logger=logger,
+                usar_fecha_filename=usar_fecha_filename,
+                dry_run=args.dry_run
+            )
+            print("\n  --- Resumen de Purga de Binarios .dat ---")
+            print(f"  Total .dat evaluados : {res_purge['total_evaluados']}")
+            print(f"  Purgados con éxito   : {res_purge['purgados']}")
+            print(f"  Omitidos (activos)   : {res_purge['omitidos_activos']}")
+            print(f"  Omitidos (no subidos): {res_purge['omitidos_no_subidos']}")
 
         print("\n" + "=" * 65)
         print("  Proceso completado satisfactoriamente.")

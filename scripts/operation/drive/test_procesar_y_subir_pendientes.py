@@ -245,6 +245,164 @@ class TestProcesarYSubirPendientes(unittest.TestCase):
         self.assertIsNotNone(lock3)
         psp.liberar_cerrojo(lock3)
 
+    # ------------------------------------------------------------------------
+    # 6. Pruebas de Cupo Dinámico y Retro-presión (DEV0)
+    # ------------------------------------------------------------------------
+    @patch("procesar_y_subir_pendientes.procesar_archivo_individual")
+    @patch("procesar_y_subir_pendientes.extraer_tiempo_binario")
+    @patch("procesar_y_subir_pendientes.nombrar_archivo_mseed")
+    def test_convertir_archivos_pendientes_con_cupo_maximo(
+        self, mock_nombrar, mock_extraer, mock_procesar
+    ):
+        """Verifica que max_convertir detiene la conversión al alcanzar el cupo solicitado."""
+        for i in range(5):
+            f = os.path.join(self.rc_dir, f"DEV00_261013-0{i}0000.dat")
+            with open(f, "wb") as fh:
+                fh.write(b"\x00" * 2506)
+
+        mock_nombrar.side_effect = lambda est, t: f"DEV0_20261013_fake_{t['hora']}.mseed"
+        mock_extraer.side_effect = lambda f, u: {"anio": 2026, "mes": 10, "dia": 13, "hora": int(f[-10:-8]), "minuto": 0, "segundo": 0}
+        mock_procesar.return_value = (True, "OK", {"tiempo_lectura": 0.1})
+
+        resumen = psp.convertir_archivos_pendientes(
+            path_registro_continuo=self.rc_dir,
+            path_archivos_mseed=self.ms_dir,
+            codigo_estacion="DEV0",
+            config_mseed={"CODIGO(1)": "DEV0"},
+            archivos_activos=set(),
+            logger=MagicMock(),
+            max_convertir=2,
+            dry_run=False
+        )
+
+        self.assertEqual(resumen["total_dat"], 5)
+        self.assertEqual(resumen["convertidos_exitosos"], 2)
+        self.assertEqual(mock_procesar.call_count, 2)
+
+    def test_obtener_cola_subida_drive_prioridades(self):
+        """Verifica que obtener_cola_subida_drive lista eventos primero y luego miniSEED horarios."""
+        f_ev = os.path.join(self.ev_dir, "DEV0_evento_1.mseed")
+        f_ms = os.path.join(self.ms_dir, "DEV0_continuo_1.mseed")
+        for f in [f_ev, f_ms]:
+            with open(f, "wb") as fh:
+                fh.write(b"DATA")
+
+        config_disp = {
+            "directorios": {
+                "archivos_mseed": self.ms_dir,
+                "eventos_extraidos": self.ev_dir
+            },
+            "drive": {
+                "carpetas": {
+                    "mseed_id": "DRIVE_MSEED_ID_DEV0",
+                    "events_id": "DRIVE_EVENTS_ID_DEV0"
+                }
+            }
+        }
+
+        cola = psp.obtener_cola_subida_drive(config_disp, self.log_dir)
+        self.assertEqual(len(cola), 2)
+        self.assertEqual(cola[0][2], "event")
+        self.assertEqual(cola[1][2], "mseed")
+
+    # ------------------------------------------------------------------------
+    # 7. Pruebas de Liberación de Espacio (--delete-uploaded y --purge-dat)
+    # ------------------------------------------------------------------------
+    @patch("procesar_y_subir_pendientes.subir_archivo_con_reintentos")
+    @patch("procesar_y_subir_pendientes.marcar_como_exitoso")
+    @patch("procesar_y_subir_pendientes.Try_Autenticar_Drive")
+    def test_subir_archivos_con_delete_uploaded(self, mock_auth, mock_marcar, mock_subir):
+        """Verifica que delete_uploaded=True transmita borrar_despues=True a subir_archivo_con_reintentos."""
+        f_ms = os.path.join(self.ms_dir, "DEV0_20261013_110000.mseed")
+        with open(f_ms, "wb") as fh:
+            fh.write(b"DATA")
+
+        config_disp = {
+            "directorios": {
+                "archivos_mseed": self.ms_dir,
+                "eventos_extraidos": self.ev_dir
+            },
+            "drive": {
+                "carpetas": {
+                    "mseed_id": "DRIVE_MSEED_ID_DEV0",
+                    "events_id": "DRIVE_EVENTS_ID_DEV0"
+                },
+                "config": {"max_reintentos": 1, "tiempo_espera": 0}
+            }
+        }
+
+        mock_auth.return_value = MagicMock()
+        mock_subir.return_value = True
+
+        resumen = psp.subir_archivos_pendientes(
+            local_root=self.test_dir,
+            config_dispositivo=config_disp,
+            log_directory=self.log_dir,
+            logger=MagicMock(),
+            batch_size=1,
+            dns_verificado=True,
+            delete_uploaded=True,
+            dry_run=False
+        )
+
+        self.assertEqual(resumen["subidos_exitosos"], 1)
+        # Verificar que borrar_despues se pasó como True
+        args, kwargs = mock_subir.call_args
+        self.assertTrue(kwargs.get("borrar_despues"))
+
+    @patch("procesar_y_subir_pendientes.ya_fue_subido")
+    @patch("procesar_y_subir_pendientes.nombrar_archivo_mseed")
+    @patch("procesar_y_subir_pendientes.extraer_tiempo_binario")
+    def test_purgar_binarios_respaldados(self, mock_extraer, mock_nombrar, mock_subido):
+        """
+        Verifica en DEV0:
+        1. Elimina .dat cuyo .mseed ya consta como subido en Drive.
+        2. Protege el archivo activo en grabación SPI.
+        3. Conserva .dat cuyo .mseed aún no ha sido subido.
+        """
+        f_activo = os.path.join(self.rc_dir, "DEV00_261013-100000.dat")
+        f_subido = os.path.join(self.rc_dir, "DEV00_261013-080000.dat")
+        f_no_subido = os.path.join(self.rc_dir, "DEV00_261013-090000.dat")
+
+        for f in [f_activo, f_subido, f_no_subido]:
+            with open(f, "wb") as fh:
+                fh.write(b"\x00" * 2506)
+
+        mock_extraer.return_value = {"anio": 2026, "mes": 10, "dia": 13, "hora": 8, "minuto": 0, "segundo": 0}
+        mock_nombrar.side_effect = lambda est, t: "DEV0_20261013_080000.mseed" if "080000" in mock_nombrar.curr else "DEV0_20261013_090000.mseed"
+
+        def fake_subido(log_dir, fname, tipo):
+            return "080000" in fname
+
+        mock_subido.side_effect = fake_subido
+
+        def fake_extraer(fpath, usar_f):
+            mock_nombrar.curr = fpath
+            return {"anio": 2026, "mes": 10, "dia": 13, "hora": 8, "minuto": 0, "segundo": 0}
+        mock_extraer.side_effect = fake_extraer
+
+        archivos_activos = {"DEV00_261013-100000.dat"}
+
+        resumen = psp.purgar_binarios_respaldados(
+            path_registro_continuo=self.rc_dir,
+            codigo_estacion="DEV0",
+            log_directory=self.log_dir,
+            archivos_activos=archivos_activos,
+            logger=MagicMock(),
+            usar_fecha_filename=False,
+            dry_run=False
+        )
+
+        self.assertEqual(resumen["total_evaluados"], 3)
+        self.assertEqual(resumen["omitidos_activos"], 1)
+        self.assertEqual(resumen["purgados"], 1)
+        self.assertEqual(resumen["omitidos_no_subidos"], 1)
+
+        # Comprobar el estado real en disco
+        self.assertTrue(os.path.exists(f_activo))
+        self.assertTrue(os.path.exists(f_no_subido))
+        self.assertFalse(os.path.exists(f_subido))
+
 
 # ============================================================================
 # 6. RUNNER COMPATIBLE CON FORMATO DE TEST_GESTOR_EVENTOS.PY Y UNITTEST
