@@ -28,9 +28,13 @@ case "$1" in
     echo "Ejecutando conversión a miniSEED..."
     "$VENV_PYTHON" "$PROJECT_LOCAL_ROOT/scripts/mseed/binary_to_mseed.py" 1
     
-    # 3. Ejecutar gestor de archivos
-    echo "Ejecutando gestor de archivos..."
-    "$VENV_PYTHON" "$PROJECT_LOCAL_ROOT/scripts/drive/gestor_archivos_acq.py" &
+    # 3. Ejecutar gestor de archivos (con guarda de concurrencia)
+    if is_running "gestor_archivos_acq.py"; then
+      echo "Aviso: gestor_archivos_acq.py ya se encuentra en ejecución. Omitiendo lanzamiento concurrente."
+    else
+      echo "Ejecutando gestor de archivos..."
+      "$VENV_PYTHON" "$PROJECT_LOCAL_ROOT/scripts/drive/gestor_archivos_acq.py" &
+    fi
     ;;
   
   stop)

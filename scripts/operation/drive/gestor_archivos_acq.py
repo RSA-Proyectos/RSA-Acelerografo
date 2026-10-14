@@ -37,11 +37,16 @@ REQUISITOS:
 import os
 import shutil
 import socket
+import fcntl
+import gc
 import json
 import logging
 import sys
 from datetime import datetime, timedelta
 import time
+
+# Constantes del sistema
+LOCK_FILE_PATH = "/tmp/gestor_archivos_acq.lock"
 
 # Importar funciones de subir_archivo.py (mismo directorio)
 from subir_archivo import (
@@ -71,6 +76,33 @@ LOG_BACKUP_COUNT = 3
 
 ######################################### ~Funciones~ #################################################
 
+def adquirir_cerrojo(lock_path=LOCK_FILE_PATH):
+    """
+    Intenta adquirir un cerrojo exclusivo no bloqueante a nivel de sistema operativo.
+    Retorna el descriptor de archivo si tuvo éxito, o None si ya hay otra instancia ejecutándose.
+    """
+    try:
+        lock_fd = open(lock_path, "w")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_fd
+    except (BlockingIOError, IOError):
+        try:
+            lock_fd.close()
+        except Exception:
+            pass
+        return None
+
+
+def liberar_cerrojo(lock_fd):
+    """Libera el cerrojo de exclusión mutua."""
+    if lock_fd:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+        except Exception:
+            pass
+
+
 # Lee un archivo de configuración en formato JSON y devuelve su contenido como un diccionario.
 def read_fileJSON(nameFile):
     try:
@@ -91,17 +123,17 @@ def get_free_space_percentage(path):
     percentage = (free / total) * 100
     return percentage
 
-# Verifica la conexión a internet intentando conectar al servidor DNS de Google
-def check_internet_connection(logger, host="8.8.8.8", port=53, timeout=3):
+# Verifica la resolución DNS real del dominio de Google Drive para evitar falsos positivos de IP pura
+def check_internet_connection(logger, host="www.googleapis.com", port=443, timeout=5):
     try:
         socket.setdefaulttimeout(timeout)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((host, port))
-        sock.close()
-        logger.info("Conexión a internet verificada.")
+        socket.getaddrinfo(host, port)
+        if logger:
+            logger.info("Resolución DNS y conectividad a Google Drive verificada.")
         return True
     except Exception as e:
-        logger.warning(f"Fallo en la conexión a internet: {e}")
+        if logger:
+            logger.warning(f"Fallo en resolución DNS hacia {host}: {e}")
         return False
 
 # Borra el archivo más antiguo con la extensión indicada en el directorio especificado
@@ -158,6 +190,37 @@ def obtener_archivo_mas_reciente(directorio, extension):
         return max(archivos, key=os.path.getmtime)
     except Exception:
         return None
+
+
+def obtener_archivos_activos_continuous(directorio_binary, project_local_root):
+    """
+    Identifica los archivos binarios (.dat) actualmente activos o en grabación SPI para
+    protegerlos de subidas o purgas accidentales.
+    Combina:
+      1. Archivo temporal NombreArchivoRegistroContinuo.tmp (línea 1).
+      2. Salvaguarda por mtime del archivo más reciente si fue modificado en las últimas 2 horas.
+    """
+    activos = set()
+    if project_local_root:
+        tmp_path = os.path.join(project_local_root, "tmp-files", "NombreArchivoRegistroContinuo.tmp")
+        if os.path.isfile(tmp_path):
+            try:
+                with open(tmp_path, "r", encoding="utf-8") as f:
+                    lineas = [l.strip() for l in f.readlines() if l.strip()]
+                    if lineas:
+                        activos.add(os.path.basename(lineas[0]))
+            except Exception:
+                pass
+
+    if directorio_binary and os.path.isdir(directorio_binary):
+        mas_reciente = obtener_archivo_mas_reciente(directorio_binary, ".dat")
+        if mas_reciente:
+            try:
+                if (time.time() - os.path.getmtime(mas_reciente)) < 7200:
+                    activos.add(os.path.basename(mas_reciente))
+            except Exception:
+                pass
+    return activos
 
 
 def calcular_antiguedad_dias(ruta_archivo):
@@ -218,7 +281,7 @@ def eliminar_archivo_con_verificacion(ruta_archivo, tipo_archivo, log_directory,
 
 #######################################################################################################
 
-def main():
+def _ejecutar_gestor():
     # Obtiene la variable de entorno para definir la ruta del archivo de configuración:
     project_local_root = os.getenv("PROJECT_LOCAL_ROOT")
     if not project_local_root:
@@ -439,19 +502,18 @@ def main():
         # ========== POLÍTICA DE RETENCIÓN TEMPORAL ==========
         retener_dias_continuous = politica_modo.get("retener_dias", {}).get("continuous", 7)
 
-        # Identificar archivo continuous más reciente (está en uso)
-        archivo_mas_reciente_continuous = obtener_archivo_mas_reciente(binary_directory, ".dat")
-
-        if archivo_mas_reciente_continuous:
-            logger.protected("continuous", os.path.basename(archivo_mas_reciente_continuous), "active_file")
+        # Identificar archivos continuous activos (en uso por SPI/C o modificados recientemente)
+        archivos_activos_continuous = obtener_archivos_activos_continuous(binary_directory, project_local_root)
+        for act_f in archivos_activos_continuous:
+            logger.protected("continuous", act_f, "active_file")
 
         # Listar archivos continuous
         archivos_continuous_paths = [os.path.join(binary_directory, f) for f in archivos_binarios]
 
-        # Eliminar archivos continuous antiguos (excepto el más reciente)
+        # Eliminar archivos continuous antiguos (excepto los activos en grabación SPI)
         for ruta_archivo in archivos_continuous_paths:
-            # Proteger el más reciente
-            if archivo_mas_reciente_continuous and ruta_archivo == archivo_mas_reciente_continuous:
+            # Proteger archivos activos
+            if os.path.basename(ruta_archivo) in archivos_activos_continuous:
                 continue
 
             # Verificar antigüedad
@@ -489,10 +551,10 @@ def main():
         if free_space < umbral_minimo:
             logger.warning(f"Espacio bajo umbral mínimo | offline | {free_space:.2f}% < {umbral_minimo}%")
 
-            # Eliminar TODOS los archivos continuous excepto el más reciente
+            # Eliminar archivos continuous excepto los activos
             archivos_continuous_paths = [os.path.join(binary_directory, f) for f in os.listdir(binary_directory) if f.endswith(".dat")]
             for ruta_archivo in archivos_continuous_paths:
-                if archivo_mas_reciente_continuous and ruta_archivo == archivo_mas_reciente_continuous:
+                if os.path.basename(ruta_archivo) in archivos_activos_continuous:
                     continue
                 nombre_archivo = os.path.basename(ruta_archivo)
 
@@ -548,64 +610,72 @@ def main():
             # ========== POLÍTICA DE SUBIDA A DRIVE ==========
             tipos_a_subir = politica_modo.get("subir", [])
 
-            # Preparar archivos para subir (empezar por los más antiguos)
+            # Preparar archivos para subir ordenados por prioridad científica:
+            # 1. Eventos sísmicos (críticos y ligeros)
+            # 2. Archivos miniSEED continuos
+            # 3. Archivos binarios continuos (.dat)
             archivos_para_subir = []
             archivos_ya_subidos_count = 0
 
-            if "mseed" in tipos_a_subir:
-                archivos_mseed_paths = [os.path.join(mseed_directory, f) for f in archivos_mseed]
-                archivos_mseed_ordenados = sorted(archivos_mseed_paths, key=os.path.getmtime)
-                for path in archivos_mseed_ordenados:
-                    nombre_archivo = os.path.basename(path)
-                    # Verificar si ya fue subido
-                    if ya_fue_subido(log_directory, nombre_archivo, "mseed"):
-                        archivos_ya_subidos_count += 1
-                        logger.skip("mseed", nombre_archivo, "already_uploaded")
-                    else:
-                        archivos_para_subir.append((path, "mseed"))
-
-            if "continuous" in tipos_a_subir:
-                archivos_binarios_paths = [os.path.join(binary_directory, f) for f in archivos_binarios]
-                archivos_binarios_ordenados = sorted(archivos_binarios_paths, key=os.path.getmtime)
-                # Proteger el más reciente (está en uso)
-                archivo_mas_reciente_continuous = obtener_archivo_mas_reciente(binary_directory, ".dat")
-                for path in archivos_binarios_ordenados:
-                    nombre_archivo = os.path.basename(path)
-                    # Proteger el más reciente
-                    if archivo_mas_reciente_continuous and path == archivo_mas_reciente_continuous:
-                        continue
-                    # Verificar si ya fue subido
-                    if ya_fue_subido(log_directory, nombre_archivo, "continuous"):
-                        archivos_ya_subidos_count += 1
-                        logger.skip("continuous", nombre_archivo, "already_uploaded")
-                    else:
-                        archivos_para_subir.append((path, "continuous"))
-
+            # Prioridad 1: Eventos sísmicos extraídos
             if "event" in tipos_a_subir and eventos_directory and os.path.isdir(eventos_directory):
                 archivos_eventos_paths = [os.path.join(eventos_directory, f) for f in archivos_eventos]
                 archivos_eventos_ordenados = sorted(archivos_eventos_paths, key=os.path.getmtime)
                 for path in archivos_eventos_ordenados:
                     nombre_archivo = os.path.basename(path)
-                    # Verificar si ya fue subido
                     if ya_fue_subido(log_directory, nombre_archivo, "event"):
                         archivos_ya_subidos_count += 1
                         logger.skip("event", nombre_archivo, "already_uploaded")
                     else:
                         archivos_para_subir.append((path, "event"))
 
+            # Prioridad 2: Archivos continuos miniSEED
+            if "mseed" in tipos_a_subir:
+                archivos_mseed_paths = [os.path.join(mseed_directory, f) for f in archivos_mseed]
+                archivos_mseed_ordenados = sorted(archivos_mseed_paths, key=os.path.getmtime)
+                for path in archivos_mseed_ordenados:
+                    nombre_archivo = os.path.basename(path)
+                    if ya_fue_subido(log_directory, nombre_archivo, "mseed"):
+                        archivos_ya_subidos_count += 1
+                        logger.skip("mseed", nombre_archivo, "already_uploaded")
+                    else:
+                        archivos_para_subir.append((path, "mseed"))
+
+            # Prioridad 3: Archivos binarios continuos (.dat)
+            if "continuous" in tipos_a_subir:
+                archivos_activos_continuous = obtener_archivos_activos_continuous(binary_directory, project_local_root)
+                archivos_binarios_paths = [os.path.join(binary_directory, f) for f in archivos_binarios]
+                archivos_binarios_ordenados = sorted(archivos_binarios_paths, key=os.path.getmtime)
+                for path in archivos_binarios_ordenados:
+                    nombre_archivo = os.path.basename(path)
+                    if nombre_archivo in archivos_activos_continuous:
+                        continue
+                    if ya_fue_subido(log_directory, nombre_archivo, "continuous"):
+                        archivos_ya_subidos_count += 1
+                        logger.skip("continuous", nombre_archivo, "already_uploaded")
+                    else:
+                        archivos_para_subir.append((path, "continuous"))
+
             # Registrar resumen de archivos ya subidos (solo si hay alguno)
             if archivos_ya_subidos_count > 0:
                 logger.summary(archivos_omitidos=archivos_ya_subidos_count, razon="ya_subidos")
 
+            # Dosificación por lotes para control de flujo y memoria (por defecto 20)
+            batch_size = config_dispositivo.get("drive", {}).get("config", {}).get("batch_size", 20)
+            total_pendientes = len(archivos_para_subir)
+            if batch_size > 0 and total_pendientes > batch_size:
+                logger.info(f"Dosificación de lote: {total_pendientes} archivos pendientes en cola, procesando lote de {batch_size} en este ciclo.")
+                archivos_para_subir = archivos_para_subir[:batch_size]
+
             # Subir archivos si hay alguno configurado
             if archivos_para_subir:
                 if dry_run:
-                    logger.info(f"[DRY-RUN] Se subirían {len(archivos_para_subir)} archivos a Google Drive")
+                    logger.info(f"[DRY-RUN] Se subirían {len(archivos_para_subir)} archivos a Google Drive (lote dosificado)")
                     for path_completo, tipo_archivo in archivos_para_subir:
                         nombre_archivo = os.path.basename(path_completo)
                         logger.info(f"[DRY-RUN] Se subiría | {tipo_archivo} | {nombre_archivo}")
                 else:
-                    logger.info(f"Archivos pendientes de subida | online | {len(archivos_para_subir)} archivos")
+                    logger.info(f"Archivos a procesar en lote | online | {len(archivos_para_subir)}/{total_pendientes} archivos")
 
                     # Obtener parámetros de Drive
                     max_reintentos = config_dispositivo.get("drive", {}).get("config", {}).get("max_reintentos", 3)
@@ -653,6 +723,13 @@ def main():
 
                             if exito:
                                 archivos_subidos += 1
+                                time.sleep(1.5)  # Espaciado anti-bufferbloat
+                                gc.collect()     # Liberación periódica de memoria
+                            else:
+                                # Fail-Fast: si la resolución DNS o la conexión fallaron, abortar el resto del lote
+                                if not check_internet_connection(logger):
+                                    logger.warning("Fallo en resolución DNS o conectividad detectado durante el lote. Abortando lote restante (fail-fast).")
+                                    break
 
                         logger.summary(upload_resumen=f"{archivos_subidos}/{len(archivos_para_subir)}", status="success")
                     else:
@@ -664,22 +741,22 @@ def main():
             # ========== POLÍTICA DE RETENCIÓN TEMPORAL ==========
             retener_dias = politica_modo.get("retener_dias", {})
 
-            # Identificar archivo continuous más reciente (está en uso)
-            archivo_mas_reciente_continuous = obtener_archivo_mas_reciente(binary_directory, ".dat")
-            if archivo_mas_reciente_continuous:
-                logger.info(f"Archivo más reciente protegido | continuous | {os.path.basename(archivo_mas_reciente_continuous)}")
+            # Identificar archivos continuous activos (en uso por SPI/C)
+            archivos_activos_continuous = obtener_archivos_activos_continuous(binary_directory, project_local_root)
+            for act_f in archivos_activos_continuous:
+                logger.info(f"Archivo activo protegido | continuous | {act_f}")
 
             # Contadores de retención temporal
             retencion_stats = {"continuous": 0, "mseed": 0, "event": 0}
 
-            # Eliminar continuous antiguos (excepto el más reciente y los fallidos)
+            # Eliminar continuous antiguos (excepto los activos y los fallidos)
             if "continuous" in retener_dias:
                 dias_continuous = retener_dias["continuous"]
                 archivos_continuous_paths = [os.path.join(binary_directory, f) for f in archivos_binarios]
 
                 for ruta_archivo in archivos_continuous_paths:
-                    # Proteger el más reciente
-                    if archivo_mas_reciente_continuous and ruta_archivo == archivo_mas_reciente_continuous:
+                    # Proteger archivos activos en grabación SPI
+                    if os.path.basename(ruta_archivo) in archivos_activos_continuous:
                         continue
 
                     # Verificar antigüedad
@@ -750,7 +827,7 @@ def main():
                 archivos_continuous_ordenados = sorted(archivos_continuous_paths, key=os.path.getmtime)
 
                 for ruta_archivo in archivos_continuous_ordenados:
-                    if archivo_mas_reciente_continuous and ruta_archivo == archivo_mas_reciente_continuous:
+                    if (archivo_mas_reciente_continuous and ruta_archivo == archivo_mas_reciente_continuous) or (os.path.basename(ruta_archivo) in archivos_activos_continuous):
                         continue
 
                     eliminado = eliminar_archivo_con_verificacion(
@@ -781,10 +858,10 @@ def main():
             if free_space < umbral_critico:
                 logger.warning(f"Espacio crítico | online | {free_space:.2f}% < {umbral_critico}%")
 
-                # Eliminar TODOS los continuous (excepto el más reciente)
+                # Eliminar TODOS los continuous (excepto los activos en grabación)
                 archivos_continuous_paths = [os.path.join(binary_directory, f) for f in os.listdir(binary_directory) if f.endswith(".dat")]
                 for ruta_archivo in archivos_continuous_paths:
-                    if archivo_mas_reciente_continuous and ruta_archivo == archivo_mas_reciente_continuous:
+                    if (archivo_mas_reciente_continuous and ruta_archivo == archivo_mas_reciente_continuous) or (os.path.basename(ruta_archivo) in archivos_activos_continuous):
                         continue
 
                     eliminado = eliminar_archivo_con_verificacion(
@@ -836,21 +913,21 @@ def main():
             free_space = get_free_space_percentage(mseed_directory)
             logger.info(f"Espacio libre | mseed | {free_space:.2f}%")
 
-            # Identificar archivo continuous más reciente
-            archivo_mas_reciente_continuous = obtener_archivo_mas_reciente(binary_directory, ".dat")
-            if archivo_mas_reciente_continuous:
-                logger.info(f"Archivo más reciente protegido | continuous | {os.path.basename(archivo_mas_reciente_continuous)}")
+            # Identificar archivos continuous activos (en uso por SPI/C o modificados recientemente)
+            archivos_activos_continuous = obtener_archivos_activos_continuous(binary_directory, project_local_root)
+            for act_f in archivos_activos_continuous:
+                logger.info(f"Archivo activo protegido | continuous | {act_f}")
 
             # Umbral mínimo
             if free_space < umbral_minimo:
                 logger.warning(f"Espacio bajo umbral mínimo | online-sin-conexión | {free_space:.2f}% < {umbral_minimo}%")
 
-                # Eliminar continuous más antiguo
+                # Eliminar continuous más antiguo (excepto los activos)
                 archivos_continuous_paths = [os.path.join(binary_directory, f) for f in os.listdir(binary_directory) if f.endswith(".dat")]
                 archivos_continuous_ordenados = sorted(archivos_continuous_paths, key=os.path.getmtime)
 
                 for ruta_archivo in archivos_continuous_ordenados:
-                    if archivo_mas_reciente_continuous and ruta_archivo == archivo_mas_reciente_continuous:
+                    if (archivo_mas_reciente_continuous and ruta_archivo == archivo_mas_reciente_continuous) or (os.path.basename(ruta_archivo) in archivos_activos_continuous):
                         continue
 
                     nombre_archivo = os.path.basename(ruta_archivo)
@@ -951,7 +1028,21 @@ def main():
 
     # Resumen final de ejecución
     logger.summary(ejecucion="completada", modo=mode_acq)
- 
+
+
+def main():
+    # Adquirir cerrojo exclusivo de proceso a nivel de SO para prevenir concurrencia descontrolada
+    lock_fd = adquirir_cerrojo()
+    if not lock_fd:
+        print("Aviso: Otra instancia de gestor_archivos_acq.py ya se encuentra en ejecución. Saliendo de forma limpia.")
+        return
+
+    try:
+        _ejecutar_gestor()
+    finally:
+        gc.collect()
+        liberar_cerrojo(lock_fd)
+
 
 if __name__ == "__main__":
     main()
