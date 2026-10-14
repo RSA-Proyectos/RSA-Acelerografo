@@ -225,8 +225,8 @@ def get_authenticated(SCOPES, credential_file, token_file, service_name = 'drive
         flags, _ = tools.argparser.parse_known_args()
         creds = tools.run_flow(flow, store, flags)
     
-    # Configurar timeout para redes lentas/inestables
-    http = Http(timeout=300)  # 5 minutos
+    # Configurar timeout para redes inestables (60s previene que un socket colgado congele el proceso)
+    http = Http(timeout=60)
     service = build(service_name, api_version, http = creds.authorize(http))
 
     return service

@@ -22,7 +22,8 @@
         },
         "config": {
             "max_reintentos": 5,
-            "tiempo_espera": 2
+            "tiempo_espera": 2,
+            "batch_size": 20
         }
     },
     "gestion_almacenamiento": {

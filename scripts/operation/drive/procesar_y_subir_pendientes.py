@@ -129,6 +129,10 @@ def adquirir_cerrojo():
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return lock_fd
     except (BlockingIOError, IOError):
+        try:
+            lock_fd.close()
+        except Exception:
+            pass
         return None
 
 
