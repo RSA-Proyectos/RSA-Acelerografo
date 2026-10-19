@@ -76,21 +76,51 @@ LOG_BACKUP_COUNT = 3
 
 ######################################### ~Funciones~ #################################################
 
-def adquirir_cerrojo(lock_path=LOCK_FILE_PATH):
+def obtener_ruta_cerrojo(lock_path=None):
+    """
+    Determina la ruta del archivo de cerrojo de forma resiliente.
+    Prioridad 1: $PROJECT_LOCAL_ROOT/tmp-files/gestor_archivos_acq.lock (permisos garantizados rsa:rsa).
+    Prioridad 2: /tmp/gestor_archivos_acq_${USER}.lock (aislamiento por usuario para evitar colisiones con root).
+    """
+    if lock_path:
+        return lock_path
+    project_root = os.environ.get("PROJECT_LOCAL_ROOT", "")
+    if project_root:
+        tmp_dir = os.path.join(project_root, "tmp-files")
+        if os.path.isdir(tmp_dir):
+            return os.path.join(tmp_dir, "gestor_archivos_acq.lock")
+    usuario = os.environ.get("USER", "rsa")
+    return f"/tmp/gestor_archivos_acq_{usuario}.lock"
+
+
+def adquirir_cerrojo(lock_path=None, return_status=False):
     """
     Intenta adquirir un cerrojo exclusivo no bloqueante a nivel de sistema operativo.
-    Retorna el descriptor de archivo si tuvo éxito, o None si ya hay otra instancia ejecutándose.
+    Si return_status=False (por defecto, retrocompatibilidad):
+        Retorna el descriptor de archivo si tuvo éxito, o None si falló o está ocupado.
+    Si return_status=True:
+        Retorna (lock_fd, "ok") si tuvo éxito.
+        Retorna (None, "ocupado") si otra instancia ya posee el cerrojo.
+        Retorna (None, "error_permiso") si no se tiene permiso de acceso/escritura.
+        Retorna (None, "error_io") ante otras fallas del sistema de archivos.
     """
+    ruta = obtener_ruta_cerrojo(lock_path)
     try:
-        lock_fd = open(lock_path, "w")
+        lock_fd = open(ruta, "a")
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return lock_fd
-    except (BlockingIOError, IOError):
+        return (lock_fd, "ok") if return_status else lock_fd
+    except BlockingIOError:
         try:
             lock_fd.close()
         except Exception:
             pass
-        return None
+        return (None, "ocupado") if return_status else None
+    except PermissionError as e:
+        sys.stderr.write(f"Error crítico de permisos en lockfile '{ruta}': {e}\n")
+        return (None, "error_permiso") if return_status else None
+    except (IOError, OSError) as e:
+        sys.stderr.write(f"Error de E/S al abrir lockfile '{ruta}': {e}\n")
+        return (None, "error_io") if return_status else None
 
 
 def liberar_cerrojo(lock_fd):
@@ -815,163 +845,176 @@ def _ejecutar_gestor():
             )
 
             # ========== POLÍTICA DE CONTROL DE ESPACIO ==========
-            free_space = get_free_space_percentage(mseed_directory)
-            logger.info(f"Espacio libre | mseed | {free_space:.2f}%")
-
-            # Umbral mínimo
-            if free_space < umbral_minimo:
-                logger.warning(f"Espacio bajo umbral mínimo | online | {free_space:.2f}% < {umbral_minimo}%")
-
-                # Eliminar archivos continuous antiguos (excepto el más reciente)
-                archivos_continuous_paths = [os.path.join(binary_directory, f) for f in os.listdir(binary_directory) if f.endswith(".dat")]
-                archivos_continuous_ordenados = sorted(archivos_continuous_paths, key=os.path.getmtime)
-
-                for ruta_archivo in archivos_continuous_ordenados:
-                    if (archivo_mas_reciente_continuous and ruta_archivo == archivo_mas_reciente_continuous) or (os.path.basename(ruta_archivo) in archivos_activos_continuous):
-                        continue
-
-                    eliminado = eliminar_archivo_con_verificacion(
-                        ruta_archivo, "continuous", log_directory, logger, dry_run
-                    )
-                    if eliminado and not dry_run:
-                        logger.delete_space("continuous", os.path.basename(ruta_archivo), "min_threshold")
-
-                # Verificar espacio nuevamente
+            try:
                 free_space = get_free_space_percentage(mseed_directory)
+                logger.info(f"Espacio libre | mseed | {free_space:.2f}%")
 
-                # Si aún bajo umbral, eliminar mseed más antiguo (verificando que no esté protegido)
+                # Umbral mínimo
                 if free_space < umbral_minimo:
-                    logger.warning(f"Espacio insuficiente tras eliminar continuous | online | {free_space:.2f}%")
+                    logger.warning(f"Espacio bajo umbral mínimo | online | {free_space:.2f}% < {umbral_minimo}%")
 
-                    archivos_mseed_paths = [os.path.join(mseed_directory, f) for f in os.listdir(mseed_directory) if f.endswith(".mseed")]
-                    archivos_mseed_ordenados = sorted(archivos_mseed_paths, key=os.path.getmtime)
+                    # Eliminar archivos continuous antiguos (excepto los activos en grabación)
+                    archivos_continuous_paths = [os.path.join(binary_directory, f) for f in os.listdir(binary_directory) if f.endswith(".dat")]
+                    archivos_continuous_ordenados = sorted(archivos_continuous_paths, key=os.path.getmtime)
 
-                    for ruta_archivo in archivos_mseed_ordenados:
+                    for ruta_archivo in archivos_continuous_ordenados:
+                        if os.path.basename(ruta_archivo) in archivos_activos_continuous:
+                            continue
+
                         eliminado = eliminar_archivo_con_verificacion(
-                            ruta_archivo, "mseed", log_directory, logger, dry_run
+                            ruta_archivo, "continuous", log_directory, logger, dry_run
                         )
                         if eliminado and not dry_run:
-                            logger.delete_space("mseed", os.path.basename(ruta_archivo), "min_threshold")
-                            break  # Eliminar solo uno a la vez
+                            logger.delete_space("continuous", os.path.basename(ruta_archivo), "min_threshold")
+                            free_space = get_free_space_percentage(mseed_directory)
+                            if free_space >= umbral_minimo:
+                                break
 
-            # Umbral crítico
-            if free_space < umbral_critico:
-                logger.warning(f"Espacio crítico | online | {free_space:.2f}% < {umbral_critico}%")
+                    # Verificar espacio nuevamente
+                    free_space = get_free_space_percentage(mseed_directory)
 
-                # Eliminar TODOS los continuous (excepto los activos en grabación)
-                archivos_continuous_paths = [os.path.join(binary_directory, f) for f in os.listdir(binary_directory) if f.endswith(".dat")]
-                for ruta_archivo in archivos_continuous_paths:
-                    if (archivo_mas_reciente_continuous and ruta_archivo == archivo_mas_reciente_continuous) or (os.path.basename(ruta_archivo) in archivos_activos_continuous):
-                        continue
+                    # Si aún bajo umbral, eliminar mseed más antiguos (FIFO, verificando que no estén protegidos)
+                    if free_space < umbral_minimo:
+                        logger.warning(f"Espacio insuficiente tras eliminar continuous | online | {free_space:.2f}%")
 
-                    eliminado = eliminar_archivo_con_verificacion(
-                        ruta_archivo, "continuous", log_directory, logger, dry_run
-                    )
-                    if eliminado and not dry_run:
-                        logger.delete_space("continuous", os.path.basename(ruta_archivo), "critical_threshold")
+                        archivos_mseed_paths = [os.path.join(mseed_directory, f) for f in os.listdir(mseed_directory) if f.endswith(".mseed")]
+                        archivos_mseed_ordenados = sorted(archivos_mseed_paths, key=os.path.getmtime)
 
-                # Verificar espacio nuevamente
-                free_space = get_free_space_percentage(mseed_directory)
+                        for ruta_archivo in archivos_mseed_ordenados:
+                            eliminado = eliminar_archivo_con_verificacion(
+                                ruta_archivo, "mseed", log_directory, logger, dry_run
+                            )
+                            if eliminado and not dry_run:
+                                logger.delete_space("mseed", os.path.basename(ruta_archivo), "min_threshold")
+                                free_space = get_free_space_percentage(mseed_directory)
+                                if free_space >= umbral_minimo:
+                                    break
 
-                # Si aún crítico, eliminar mseed más antiguos (FIFO, verificando protección)
+                # Umbral crítico
                 if free_space < umbral_critico:
-                    archivos_mseed_paths = [os.path.join(mseed_directory, f) for f in os.listdir(mseed_directory) if f.endswith(".mseed")]
-                    archivos_mseed_ordenados = sorted(archivos_mseed_paths, key=os.path.getmtime)
+                    logger.warning(f"Espacio crítico | online | {free_space:.2f}% < {umbral_critico}%")
 
-                    for ruta_archivo in archivos_mseed_ordenados:
+                    # Eliminar TODOS los continuous (excepto los activos en grabación)
+                    archivos_continuous_paths = [os.path.join(binary_directory, f) for f in os.listdir(binary_directory) if f.endswith(".dat")]
+                    for ruta_archivo in archivos_continuous_paths:
+                        if os.path.basename(ruta_archivo) in archivos_activos_continuous:
+                            continue
+
                         eliminado = eliminar_archivo_con_verificacion(
-                            ruta_archivo, "mseed", log_directory, logger, dry_run
+                            ruta_archivo, "continuous", log_directory, logger, dry_run
                         )
                         if eliminado and not dry_run:
-                            logger.delete_space("mseed", os.path.basename(ruta_archivo), "critical_threshold")
-                            # Verificar si ya se alcanzó el umbral
-                            free_space = get_free_space_percentage(mseed_directory)
-                            if free_space >= umbral_critico:
-                                break
+                            logger.delete_space("continuous", os.path.basename(ruta_archivo), "critical_threshold")
 
-                # Si aún crítico tras mseed, desalojar eventos más antiguos (FIFO, verificando protección)
-                free_space = get_free_space_percentage(mseed_directory)
-                if free_space < umbral_critico and eventos_directory and os.path.isdir(eventos_directory):
-                    archivos_event_paths = [os.path.join(eventos_directory, f) for f in os.listdir(eventos_directory) if f.endswith(".mseed")]
-                    archivos_event_ordenados = sorted(archivos_event_paths, key=os.path.getmtime)
+                    # Verificar espacio nuevamente
+                    free_space = get_free_space_percentage(mseed_directory)
 
-                    for ruta_archivo in archivos_event_ordenados:
-                        eliminado = eliminar_archivo_con_verificacion(
-                            ruta_archivo, "event", log_directory, logger, dry_run
-                        )
-                        if eliminado and not dry_run:
-                            logger.delete_space("event", os.path.basename(ruta_archivo), "critical_threshold")
-                            free_space = get_free_space_percentage(mseed_directory)
-                            if free_space >= umbral_critico:
-                                break
+                    # Si aún crítico, eliminar mseed más antiguos (FIFO, verificando protección)
+                    if free_space < umbral_critico:
+                        archivos_mseed_paths = [os.path.join(mseed_directory, f) for f in os.listdir(mseed_directory) if f.endswith(".mseed")]
+                        archivos_mseed_ordenados = sorted(archivos_mseed_paths, key=os.path.getmtime)
+
+                        for ruta_archivo in archivos_mseed_ordenados:
+                            eliminado = eliminar_archivo_con_verificacion(
+                                ruta_archivo, "mseed", log_directory, logger, dry_run
+                            )
+                            if eliminado and not dry_run:
+                                logger.delete_space("mseed", os.path.basename(ruta_archivo), "critical_threshold")
+                                # Verificar si ya se alcanzó el umbral
+                                free_space = get_free_space_percentage(mseed_directory)
+                                if free_space >= umbral_critico:
+                                    break
+
+                    # Si aún crítico tras mseed, desalojar eventos más antiguos (FIFO, verificando protección)
+                    free_space = get_free_space_percentage(mseed_directory)
+                    if free_space < umbral_critico and eventos_directory and os.path.isdir(eventos_directory):
+                        archivos_event_paths = [os.path.join(eventos_directory, f) for f in os.listdir(eventos_directory) if f.endswith(".mseed")]
+                        archivos_event_ordenados = sorted(archivos_event_paths, key=os.path.getmtime)
+
+                        for ruta_archivo in archivos_event_ordenados:
+                            eliminado = eliminar_archivo_con_verificacion(
+                                ruta_archivo, "event", log_directory, logger, dry_run
+                            )
+                            if eliminado and not dry_run:
+                                logger.delete_space("event", os.path.basename(ruta_archivo), "critical_threshold")
+                                free_space = get_free_space_percentage(mseed_directory)
+                                if free_space >= umbral_critico:
+                                    break
+            except Exception as e:
+                logger.error("control_espacio", f"Excepción durante control de espacio: {str(e)}")
 
         else:
             # ========== MODO ONLINE SIN CONECTIVIDAD ==========
             logger.warning("Modo online sin conectividad | online | acumulando archivos")
 
-            # Solo aplicar control de espacio (no subir, no eliminar por retención)
-            free_space = get_free_space_percentage(mseed_directory)
-            logger.info(f"Espacio libre | mseed | {free_space:.2f}%")
-
-            # Identificar archivos continuous activos (en uso por SPI/C o modificados recientemente)
-            archivos_activos_continuous = obtener_archivos_activos_continuous(binary_directory, project_local_root)
-            for act_f in archivos_activos_continuous:
-                logger.info(f"Archivo activo protegido | continuous | {act_f}")
-
-            # Umbral mínimo
-            if free_space < umbral_minimo:
-                logger.warning(f"Espacio bajo umbral mínimo | online-sin-conexión | {free_space:.2f}% < {umbral_minimo}%")
-
-                # Eliminar continuous más antiguo (excepto los activos)
-                archivos_continuous_paths = [os.path.join(binary_directory, f) for f in os.listdir(binary_directory) if f.endswith(".dat")]
-                archivos_continuous_ordenados = sorted(archivos_continuous_paths, key=os.path.getmtime)
-
-                for ruta_archivo in archivos_continuous_ordenados:
-                    if (archivo_mas_reciente_continuous and ruta_archivo == archivo_mas_reciente_continuous) or (os.path.basename(ruta_archivo) in archivos_activos_continuous):
-                        continue
-
-                    nombre_archivo = os.path.basename(ruta_archivo)
-
-                    if dry_run:
-                        logger.info(f"[DRY-RUN] Se borraría por espacio | continuous | {nombre_archivo}")
-                        break
-                    if not dry_run:
-                        try:
-                            os.remove(ruta_archivo)
-                            logger.delete_space("continuous", nombre_archivo, "no_connection_min_threshold")
-                            break
-                        except Exception as e:
-                            logger.error("delete_space_continuous_no_conn", str(e))
-                            break
-
-                # Verificar espacio nuevamente
+            try:
+                # Solo aplicar control de espacio (no subir, no eliminar por retención)
                 free_space = get_free_space_percentage(mseed_directory)
+                logger.info(f"Espacio libre | mseed | {free_space:.2f}%")
 
-                # Si aún bajo umbral, eliminar mseed más antiguo (FIFO)
+                # Identificar archivos continuous activos (en uso por SPI/C o modificados recientemente)
+                archivos_activos_continuous = obtener_archivos_activos_continuous(binary_directory, project_local_root)
+                for act_f in archivos_activos_continuous:
+                    logger.info(f"Archivo activo protegido | continuous | {act_f}")
+
+                # Umbral mínimo
                 if free_space < umbral_minimo:
-                    logger.warning(f"Espacio insuficiente | online-sin-conexión | {free_space:.2f}%")
+                    logger.warning(f"Espacio bajo umbral mínimo | online-sin-conexión | {free_space:.2f}% < {umbral_minimo}%")
+
+                    # Eliminar continuous más antiguo (excepto los activos)
+                    archivos_continuous_paths = [os.path.join(binary_directory, f) for f in os.listdir(binary_directory) if f.endswith(".dat")]
+                    archivos_continuous_ordenados = sorted(archivos_continuous_paths, key=os.path.getmtime)
+
+                    for ruta_archivo in archivos_continuous_ordenados:
+                        if os.path.basename(ruta_archivo) in archivos_activos_continuous:
+                            continue
+
+                        nombre_archivo = os.path.basename(ruta_archivo)
+
+                        if dry_run:
+                            logger.info(f"[DRY-RUN] Se borraría por espacio | continuous | {nombre_archivo}")
+                            break
+                        if not dry_run:
+                            try:
+                                os.remove(ruta_archivo)
+                                logger.delete_space("continuous", nombre_archivo, "no_connection_min_threshold")
+                                free_space = get_free_space_percentage(mseed_directory)
+                                if free_space >= umbral_minimo:
+                                    break
+                            except Exception as e:
+                                logger.error("delete_space_continuous_no_conn", str(e))
+                                break
+
+                    # Verificar espacio nuevamente
+                    free_space = get_free_space_percentage(mseed_directory)
+
+                    # Si aún bajo umbral, eliminar mseed más antiguo (FIFO)
+                    if free_space < umbral_minimo:
+                        logger.warning(f"Espacio insuficiente | online-sin-conexión | {free_space:.2f}%")
+                        delete_oldest_file(mseed_directory, ".mseed", logger, dry_run)
+
+                # Umbral crítico
+                if free_space < umbral_critico:
+                    logger.warning(f"Espacio crítico | online-sin-conexión | {free_space:.2f}% < {umbral_critico}%")
                     delete_oldest_file(mseed_directory, ".mseed", logger, dry_run)
 
-            # Umbral crítico
-            if free_space < umbral_critico:
-                logger.warning(f"Espacio crítico | online-sin-conexión | {free_space:.2f}% < {umbral_critico}%")
-                delete_oldest_file(mseed_directory, ".mseed", logger, dry_run)
+                    # Si aún crítico tras mseed, desalojar eventos más antiguos (FIFO, verificando protección)
+                    free_space = get_free_space_percentage(mseed_directory)
+                    if free_space < umbral_critico and eventos_directory and os.path.isdir(eventos_directory):
+                        archivos_event_paths = [os.path.join(eventos_directory, f) for f in os.listdir(eventos_directory) if f.endswith(".mseed")]
+                        archivos_event_ordenados = sorted(archivos_event_paths, key=os.path.getmtime)
 
-                # Si aún crítico tras mseed, desalojar eventos más antiguos (FIFO, verificando protección)
-                free_space = get_free_space_percentage(mseed_directory)
-                if free_space < umbral_critico and eventos_directory and os.path.isdir(eventos_directory):
-                    archivos_event_paths = [os.path.join(eventos_directory, f) for f in os.listdir(eventos_directory) if f.endswith(".mseed")]
-                    archivos_event_ordenados = sorted(archivos_event_paths, key=os.path.getmtime)
-
-                    for ruta_archivo in archivos_event_ordenados:
-                        eliminado = eliminar_archivo_con_verificacion(
-                            ruta_archivo, "event", log_directory, logger, dry_run
-                        )
-                        if eliminado and not dry_run:
-                            logger.delete_space("event", os.path.basename(ruta_archivo), "no_connection_critical_threshold")
-                            free_space = get_free_space_percentage(mseed_directory)
-                            if free_space >= umbral_critico:
-                                break
+                        for ruta_archivo in archivos_event_ordenados:
+                            eliminado = eliminar_archivo_con_verificacion(
+                                ruta_archivo, "event", log_directory, logger, dry_run
+                            )
+                            if eliminado and not dry_run:
+                                logger.delete_space("event", os.path.basename(ruta_archivo), "no_connection_critical_threshold")
+                                free_space = get_free_space_percentage(mseed_directory)
+                                if free_space >= umbral_critico:
+                                    break
+            except Exception as e:
+                logger.error("control_espacio_sin_conexion", f"Excepción durante control de espacio sin conexión: {str(e)}")
 
     else:
         logger.error("main", f"Modo de adquisición desconocido: {mode_acq}")
@@ -1032,10 +1075,24 @@ def _ejecutar_gestor():
 
 def main():
     # Adquirir cerrojo exclusivo de proceso a nivel de SO para prevenir concurrencia descontrolada
-    lock_fd = adquirir_cerrojo()
+    resultado = adquirir_cerrojo(return_status=True)
+    if isinstance(resultado, tuple):
+        lock_fd, estado = resultado
+    else:
+        lock_fd, estado = resultado, "ocupado" if resultado is None else "ok"
+
     if not lock_fd:
-        print("Aviso: Otra instancia de gestor_archivos_acq.py ya se encuentra en ejecución. Saliendo de forma limpia.")
-        return
+        if estado == "ocupado":
+            print("Aviso: Otra instancia de gestor_archivos_acq.py ya se encuentra en ejecución. Saliendo de forma limpia.")
+            return
+        elif estado == "error_permiso":
+            print("ERROR: Permiso denegado al acceder al archivo de cerrojo. Verifique la propiedad del archivo.")
+            sys.exit(1)
+            return
+        else:
+            print(f"ERROR: No se pudo adquirir el cerrojo del sistema ({estado}).")
+            sys.exit(1)
+            return
 
     try:
         _ejecutar_gestor()

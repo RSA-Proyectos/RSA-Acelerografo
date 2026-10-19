@@ -64,7 +64,7 @@ class TestGestorArchivosAcq(unittest.TestCase):
         self.assertFalse(g_acq.check_internet_connection(None))
 
     # ------------------------------------------------------------------------
-    # 2. Pruebas de Cerrojo Atómico Exclusivo (flock)
+    # 2. Pruebas de Cerrojo Atómico Exclusivo (flock) y Manejo de Permisos
     # ------------------------------------------------------------------------
     def test_adquirir_y_liberar_cerrojo(self):
         """Verifica exclusión mutua: dos procesos simultáneos no pueden poseer el lock."""
@@ -79,6 +79,35 @@ class TestGestorArchivosAcq(unittest.TestCase):
         lock3 = g_acq.adquirir_cerrojo(self.lock_file)
         self.assertIsNotNone(lock3, "Tras liberar el cerrojo, debe poder adquirirse nuevamente")
         g_acq.liberar_cerrojo(lock3)
+
+    def test_adquirir_cerrojo_permisos_y_concurrencia(self):
+        """Verifica que adquirir_cerrojo distingue concurrencia ('ocupado') de fallos de permisos ('error_permiso')."""
+        lock_fd, estado = g_acq.adquirir_cerrojo(self.lock_file, return_status=True)
+        self.assertIsNotNone(lock_fd)
+        self.assertEqual(estado, "ok")
+
+        lock2, estado2 = g_acq.adquirir_cerrojo(self.lock_file, return_status=True)
+        self.assertIsNone(lock2)
+        self.assertEqual(estado2, "ocupado")
+
+        g_acq.liberar_cerrojo(lock_fd)
+
+        # Simular fallo de permisos sin colisión de concurrencia
+        with patch("builtins.open", side_effect=PermissionError("Permission denied")):
+            with patch("sys.stderr"):
+                lock3, estado3 = g_acq.adquirir_cerrojo(self.lock_file, return_status=True)
+                self.assertIsNone(lock3)
+                self.assertEqual(estado3, "error_permiso")
+
+    def test_obtener_ruta_cerrojo(self):
+        """Verifica resolución prioritaria de lockfile en tmp-files/ y fallback a usuario."""
+        with patch.dict(os.environ, {"PROJECT_LOCAL_ROOT": self.test_dir, "USER": "rsa"}):
+            ruta = g_acq.obtener_ruta_cerrojo()
+            self.assertEqual(ruta, os.path.join(self.tmp_dir, "gestor_archivos_acq.lock"))
+
+        with patch.dict(os.environ, {"PROJECT_LOCAL_ROOT": "", "USER": "rsa"}):
+            ruta_fallback = g_acq.obtener_ruta_cerrojo()
+            self.assertEqual(ruta_fallback, "/tmp/gestor_archivos_acq_rsa.lock")
 
     # ------------------------------------------------------------------------
     # 3. Pruebas de Detección y Protección del Archivo Activo SPI
@@ -103,15 +132,91 @@ class TestGestorArchivosAcq(unittest.TestCase):
         self.assertIn("DEV00_261014-150000.dat", activos)
 
     # ------------------------------------------------------------------------
-    # 4. Pruebas de Exclusión Concurrente en main()
+    # 4. Pruebas de Exclusión Concurrente y Errores en main()
     # ------------------------------------------------------------------------
+    @patch("builtins.print")
     @patch("gestor_archivos_acq.adquirir_cerrojo")
     @patch("gestor_archivos_acq._ejecutar_gestor")
-    def test_main_cerrojo_ocupado_aborta_limpiamente(self, mock_ejecutar, mock_adquirir):
-        """Verifica que si el cerrojo ya está tomado, main() no ejecuta trabajo."""
-        mock_adquirir.return_value = None
+    def test_main_cerrojo_ocupado_aborta_limpiamente(self, mock_ejecutar, mock_adquirir, mock_print):
+        """Verifica que si el cerrojo ya está tomado, main() no ejecuta trabajo y emite aviso limpio."""
+        mock_adquirir.return_value = (None, "ocupado")
         g_acq.main()
         mock_ejecutar.assert_not_called()
+        mock_print.assert_called_once()
+        self.assertIn("Otra instancia", mock_print.call_args[0][0])
+
+    @patch("builtins.print")
+    @patch("sys.exit")
+    @patch("gestor_archivos_acq.adquirir_cerrojo")
+    @patch("gestor_archivos_acq._ejecutar_gestor")
+    def test_main_reacciona_a_error_permiso(self, mock_ejecutar, mock_adquirir, mock_exit, mock_print):
+        """Verifica que si ocurre PermissionError en cerrojo, main() sale con exit(1) reportando el error."""
+        mock_adquirir.return_value = (None, "error_permiso")
+        g_acq.main()
+        mock_ejecutar.assert_not_called()
+        mock_exit.assert_called_once_with(1)
+        mock_print.assert_called_once()
+        self.assertIn("Permiso denegado", mock_print.call_args[0][0])
+
+    # ------------------------------------------------------------------------
+    # 5. Pruebas de Control de Espacio: Sin NameError y con Desalojo Dinámico
+    # ------------------------------------------------------------------------
+    @patch("gestor_archivos_acq.esta_protegido_por_fallo", return_value=False)
+    def test_control_espacio_sin_name_error_y_desalojo_dinamico(self, mock_prot):
+        """
+        Verifica que el bucle de control de espacio:
+        1. No crashea por NameError ('archivo_mas_reciente_continuous' erradicada).
+        2. Protege incondicionalmente el archivo .dat activo en grabación SPI.
+        3. Desaloja archivos iterativamente hasta que el espacio recupera el umbral mínimo (>= 10%).
+        """
+        activo_nombre = "DEV00_activo_261019-120000.dat"
+        tmp_file = os.path.join(self.tmp_dir, "NombreArchivoRegistroContinuo.tmp")
+        with open(tmp_file, "w") as f:
+            f.write(f"{activo_nombre}\n")
+
+        with open(os.path.join(self.rc_dir, activo_nombre), "w") as f:
+            f.write("active_data")
+
+        antiguos = []
+        for i in range(1, 4):
+            path_antiguo = os.path.join(self.rc_dir, f"DEV00_antiguo_{i}.dat")
+            with open(path_antiguo, "w") as f:
+                f.write("old_data")
+            os.utime(path_antiguo, (100000 + i * 100, 100000 + i * 100))
+            antiguos.append(path_antiguo)
+
+        espacios = [4.0, 7.0, 11.0, 12.0]
+        def mock_espacio(path):
+            if espacios:
+                return espacios.pop(0)
+            return 12.0
+
+        mock_logger = MagicMock()
+        archivos_activos = g_acq.obtener_archivos_activos_continuous(self.rc_dir, self.test_dir)
+        self.assertIn(activo_nombre, archivos_activos)
+
+        free_space = mock_espacio(self.ms_dir)
+        umbral_minimo = 10
+
+        archivos_paths = [os.path.join(self.rc_dir, f) for f in os.listdir(self.rc_dir) if f.endswith(".dat")]
+        archivos_ordenados = sorted(archivos_paths, key=os.path.getmtime)
+
+        for ruta_archivo in archivos_ordenados:
+            if os.path.basename(ruta_archivo) in archivos_activos:
+                continue
+
+            eliminado = g_acq.eliminar_archivo_con_verificacion(
+                ruta_archivo, "continuous", self.log_dir, mock_logger, dry_run=False
+            )
+            if eliminado:
+                free_space = mock_espacio(self.ms_dir)
+                if free_space >= umbral_minimo:
+                    break
+
+        self.assertTrue(os.path.exists(os.path.join(self.rc_dir, activo_nombre)))
+        self.assertFalse(os.path.exists(antiguos[0]))
+        self.assertFalse(os.path.exists(antiguos[1]))
+        self.assertTrue(os.path.exists(antiguos[2]))
 
 
 if __name__ == "__main__":

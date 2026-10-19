@@ -42,6 +42,9 @@ case "$1" in
     sudo systemctl stop rsa-acelerografo.service
     pkill -f binary_to_mseed.py 2>/dev/null
     pkill -f gestor_archivos_acq.py 2>/dev/null
+    # Limpieza proactiva de cerrojos huérfanos
+    rm -f /tmp/gestor_archivos_acq*.lock 2>/dev/null
+    rm -f "$PROJECT_LOCAL_ROOT/tmp-files/gestor_archivos_acq.lock" 2>/dev/null
     sudo "$PROJECT_LOCAL_ROOT/scripts/acelerografo/ejecutables/reset_master"
     ;;
 
