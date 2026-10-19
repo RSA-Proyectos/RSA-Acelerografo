@@ -2,15 +2,15 @@
 proyecto: acelerografo
 tipo: contexto_tecnico
 archivo: scripts/task/registrocontinuo.sh
-temas: [bash, systemd, orquestacion, crontab, adquisicion, concurrencia]
-generado: 2026-10-16
+temas: [bash, systemd, orquestacion, crontab, adquisicion, concurrencia, cerrojo]
+generado: 2026-10-19
 ---
 # registrocontinuo.sh — Contexto para Agentes IA
 
-> Script Bash orquestador del pipeline de adquisición sísmica continua en Raspberry Pi. Ejecutado típicamente cada hora por crontab (`0 * * * *`). Supervisa el servicio de adquisición en C vía systemd, ejecuta secuencialmente la conversión de binarios a miniSEED y dispara el gestor de subida a Google Drive con guardas de concurrencia contra procesos colgados.
+> Script Bash orquestador del pipeline de adquisición sísmica continua en Raspberry Pi. Ejecutado típicamente cada hora por crontab (`0 * * * *`). Supervisa el servicio de adquisición en C vía systemd, ejecuta secuencialmente la conversión de binarios a miniSEED y dispara el gestor de subida a Google Drive con guardas de concurrencia contra procesos colgados y purga proactiva de cerrojos de proceso.
 
 **Ruta**: `scripts/task/registrocontinuo.sh`  
-**LOC**: 62 | **Lenguaje**: Bash  
+**LOC**: ~68 | **Lenguaje**: Bash  
 **Ejecución**: Cron horaria (`crontab -e`: `0 * * * * /bin/bash .../scripts/task/registrocontinuo.sh start`) y comandos manuales de mantenimiento.
 
 ---
@@ -59,7 +59,7 @@ El script acepta tres acciones principales por línea de comandos:
 # Iniciar pipeline (verificar daemon, convertir miniSEED y lanzar gestor)
 /ruta/scripts/task/registrocontinuo.sh start
 
-# Detener adquisición, matar conversiones/gestores residuales y reiniciar dsPIC
+# Detener adquisición, matar conversiones/gestores residuales, purgar locks y reiniciar dsPIC
 /ruta/scripts/task/registrocontinuo.sh stop
 
 # Reiniciar ciclo completo
@@ -81,7 +81,11 @@ El script acepta tres acciones principales por línea de comandos:
 ### `stop`
 1. Detiene el servicio systemd (`sudo systemctl stop rsa-acelerografo.service`).
 2. Termina procesos huérfanos con `pkill -f binary_to_mseed.py` y `pkill -f gestor_archivos_acq.py`.
-3. Ejecuta el reseteo por hardware del microcontrolador dsPIC mediante el binario `reset_master` (pulsando el pin MCLR).
+3. **Purga Proactiva de Cerrojos de Proceso**: Elimina archivos de cerrojo huérfanos con:
+   - `rm -f /tmp/gestor_archivos_acq*.lock`
+   - `rm -f "$PROJECT_LOCAL_ROOT/tmp-files/gestor_archivos_acq.lock"`  
+   Garantiza que ningún residuo de ejecución previa bloquee inicios limpios posteriores.
+4. Ejecuta el reseteo por hardware del microcontrolador dsPIC mediante el binario `reset_master` (pulsando el pin MCLR).
 
 ### `restart`
 Ejecuta `$0 stop && $0 start`.

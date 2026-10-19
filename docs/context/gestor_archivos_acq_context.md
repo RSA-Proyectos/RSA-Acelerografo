@@ -2,16 +2,16 @@
 proyecto: acelerografo
 tipo: contexto_tecnico
 archivo: scripts/operation/drive/gestor_archivos_acq.py
-temas: [drive, almacenamiento, bufferbloat, flock, dns, concurrencia, resiliencia]
-generado: 2026-10-16
+temas: [drive, almacenamiento, bufferbloat, flock, cerrojo, permisos, desalojo-iterativo, resiliencia]
+generado: 2026-10-19
 ---
 # gestor_archivos_acq.py — Contexto para Agentes IA
 
-> Daemon/script Python robusto que gestiona el almacenamiento, sincronización con Google Drive y políticas de retención de archivos binarios (`.dat`), miniSEED continuo (`.mseed`) y eventos extraídos (`.mseed`). Incorpora cerrojo atómico exclusivo en `/tmp`, verificación DNS real contra `www.googleapis.com`, subida priorizada por lotes (`batch_size`), pausas anti-bufferbloat y recolección forzada de basura para evitar saturación de RAM y swap thrashing en Raspberry Pi 3B+.
+> Daemon/script Python robusto que gestiona el almacenamiento, sincronización con Google Drive y políticas de retención de archivos binarios (`.dat`), miniSEED continuo (`.mseed`) y eventos extraídos (`.mseed`). Incorpora cerrojo atómico exclusivo con resolución de ruta protegida (`tmp-files/`), discriminación de permisos en `fcntl.flock`, verificación DNS real contra `www.googleapis.com`, subida priorizada por lotes (`batch_size`), pausas anti-bufferbloat, desalojo dinámico iterativo con reevaluación de umbrales y recolección forzada de basura para evitar saturación de RAM, deadlocks de permisos y llenado de disco en Raspberry Pi 3B+.
 
 **Ruta**: `scripts/operation/drive/gestor_archivos_acq.py`  
-**LOC**: ~1050 | **Lenguaje**: Python 3 | **Ejecución**: Periódica (cron horaria mediante `scripts/task/registrocontinuo.sh` start)  
-**Lockfile**: `/tmp/gestor_archivos_acq.lock` (`fcntl.flock` exclusivo no bloqueante)  
+**LOC**: ~1080 | **Lenguaje**: Python 3 | **Ejecución**: Periódica (cron horaria mediante `scripts/task/registrocontinuo.sh` start)  
+**Lockfile**: `$PROJECT_LOCAL_ROOT/tmp-files/gestor_archivos_acq.lock` (fallback a `/tmp/gestor_archivos_acq_${USER}.lock`)  
 
 ---
 
@@ -20,7 +20,8 @@ generado: 2026-10-16
 ```mermaid
 graph TD
     subgraph Inicializacion
-        LOCK["Cerrojo Exclusivo<br>/tmp/gestor_archivos_acq.lock"]
+        RUTA["obtener_ruta_cerrojo()<br>Prioriza tmp-files/ (rsa:rsa)<br>Fallback /tmp/*_{USER}.lock"]
+        LOCK{"adquirir_cerrojo()<br>fcntl.flock(LOCK_EX | LOCK_NB)"}
         CFG["configuracion_dispositivo.json"]
         ACTIVOS["Archivos Activos Continuous<br>(NombreArchivoRegistroContinuo.tmp / mtime < 2h)"]
     end
@@ -49,13 +50,15 @@ graph TD
     end
 
     subgraph LimpiezaRetencion
-        RET["Retención Temporal"]
-        ESP["Control Espacio en Disco"]
+        RET["Retención Temporal (7d dat, 30d mseed)"]
+        ESP["Desalojo Dinámico Iterativo<br>while free_space < umbral: borrar()"]
         SANEAMIENTO["Saneamiento Registro Espejo<br>(poda de huérfanos)"]
     end
 
+    RUTA --> LOCK
     LOCK -->|Adquirido| CFG
-    LOCK -->|Ocupado| ABORT["Abortar Limpiamente"]
+    LOCK -->|Ocupado| ABORT_OK["Salida Limpia (exit 0)"]
+    LOCK -->|Error Permiso| ABORT_ERR["Fallo Crítico (exit 1)"]
     CFG --> ACTIVOS
     ACTIVOS --> MODO
     MODO -->|online| DNS
@@ -78,33 +81,37 @@ graph TD
 
 ### 1. Modo ONLINE (con conexión confirmada)
 
-1. **Adquisición del Cerrojo**: `adquirir_cerrojo("/tmp/gestor_archivos_acq.lock")`. Si otro proceso o instancia cron está corriendo, termina inmediatamente con log de advertencia evitando acumulación de procesos durmientes y contienda de memoria.
-2. **Detección de Archivos Activos**: `obtener_archivos_activos_continuous()` inspecciona `NombreArchivoRegistroContinuo.tmp` y filtra archivos binarios con `mtime` menor a 2 horas para evitar que la rotación horaria de `registro_continuo_4.5.0.c` sea eliminada o subida prematuramente.
-3. **Verificación DNS Real**: Ejecuta `socket.getaddrinfo("www.googleapis.com", 443, timeout=5)`. Evita el falso positivo del antiguo ping a `8.8.8.8:53` cuando el router responde localmente pero el enlace wan o el resolver DNS están caídos.
+1. **Resolución y Adquisición de Cerrojo**:
+   - `obtener_ruta_cerrojo()` determina la ubicación del lockfile priorizando `$PROJECT_LOCAL_ROOT/tmp-files/gestor_archivos_acq.lock` (propiedad de `rsa:rsa`), evitando conflictos de permisos si el archivo en `/tmp/` fue creado previamente por `root`.
+   - `adquirir_cerrojo()` discrimina `BlockingIOError` (concurrencia legítima $\to$ log informativo y salida limpia código 0) de `PermissionError` (emite error a `sys.stderr` y finaliza con código 1).
+2. **Detección de Archivos Activos**:
+   - `obtener_archivos_activos_continuous()` inspecciona `NombreArchivoRegistroContinuo.tmp` y archivos con `mtime < 2h`.
+   - Se utiliza exclusivamente `archivos_activos_continuous` para todas las evaluaciones (eliminando la variable no declarada `archivo_mas_reciente_continuous`).
+3. **Verificación DNS Real**:
+   - Ejecuta `socket.getaddrinfo("www.googleapis.com", 443, timeout=5)`.
 4. **Subida Priorizada por Lotes (`batch_size`)**:
-   - Procesa primero la cola de **eventos extraídos (`event`)** (máximo `batch_size`).
-   - Luego la cola de **miniSEED continuo (`mseed`)** (máximo `batch_size`).
-   - Finalmente **binarios (`continuous`)** si están habilitados en la configuración.
-   - Aplica `time.sleep(1.5)` tras cada archivo subido para drenar buffers en módems celulares/ADSL (anti-bufferbloat).
-   - Corta el ciclo anticipadamente (*fail-fast*) si un archivo falla por timeout o error de red, impidiendo saturación de socket.
-   - Invoca `gc.collect()` tras cada fase de subida para desasignar memoria de tramas y payloads SSL de Google Client API.
+   - `event` $\to$ `mseed` $\to$ `continuous` (lotes de 20).
+   - Pausa de 1.5s anti-bufferbloat.
+   - Fail-fast ante corte de enlace.
+   - `gc.collect()` tras cada lote.
 5. **Políticas de Retención Temporal**:
-   - `continuous > N días`: Elimina binarios viejos, protegiendo explícitamente los archivos activos detectados.
-   - `mseed > N días` y `event > N días`: Elimina con verificación de estado en `drive_status_manager`.
-6. **Control de Espacio en Disco**:
-   - Si `% libre < umbral_minimo (10%)`: Desaloja `.dat` no activos; si persiste bajo umbral, desaloja `.mseed` continuo FIFO.
-   - Si `% libre < umbral_critico (5%)`: Desaloja `.mseed` continuo FIFO; en última instancia desaloja eventos extraídos FIFO verificando no eliminar protegidos.
+   - `continuous > 7 días` (estandarizado en template online).
+   - `mseed > 30 días` y `event > 30 días`.
+6. **Desalojo Dinámico Iterativo de Espacio**:
+   - En umbral mínimo (10%) y crítico (5%), ejecuta un bucle iterativo que reevalúa `get_free_space_percentage()` tras cada eliminación. Se detiene tan pronto como `free_space >= umbral_minimo`.
+   - Todo el bloque de control de espacio se protege con `try...except Exception as e:` con log estructurado (`logger.error`), garantizando que un fallo de I/O en un archivo aislado no impida la ejecución del saneamiento de registros.
 7. **Saneamiento del Registro Espejo**:
-   - `limpiar_archivos_inexistentes()` compara el registro JSON local contra el sistema de archivos real y elimina huérfanos.
-8. **Liberación Garantizada del Cerrojo**: En bloque `finally:` de `main()`.
+   - `limpiar_archivos_inexistentes()` purga huérfanos de `uploaded_files_registry.json`.
+8. **Liberación Garantizada**:
+   - En bloque `finally:` de `main()`.
 
 ### 2. Modo ONLINE (sin conexión o falla DNS)
-- No intenta conectarse a Google Drive ni reintenta timeouts prolongados.
-- Salta la subida y retención temporal, ejecutando únicamente el control de espacio en disco de emergencia para garantizar continuidad operativa del adquisidor C.
+- Omite llamadas a Google Drive API y retención temporal.
+- Ejecuta de inmediato el control de espacio en disco de emergencia (desalojo iterativo) protegiendo archivos activos.
 
 ### 3. Modo OFFLINE
-- Retención local según días configurados (`retener_dias.continuous` default 7, `event` default 30).
-- Desalojo por espacio mínimo y crítico respetando archivos activos.
+- Retención local según días configurados (`continuous: 7`, `event: 30`).
+- Desalojo dinámico iterativo por umbral mínimo y crítico respetando archivos activos.
 
 ---
 
@@ -112,13 +119,16 @@ graph TD
 
 | Mecanismo | Implementación | Propósito / Beneficio |
 |-----------|----------------|-----------------------|
-| **Cerrojo Atómico de Proceso** | `fcntl.flock(lock_fd, fcntl.LOCK_EX \| fcntl.LOCK_NB)` | Garantiza una sola instancia activa en todo momento. Elimina acumulación de procesos por cuelgues de subida. |
+| **Ruta de Cerrojo Aislada** | `obtener_ruta_cerrojo()` | Prioriza `$PROJECT_LOCAL_ROOT/tmp-files/`, inmune a colisiones de permisos con `root` en `/tmp/`. |
+| **Discriminación de Excepciones Flock** | `BlockingIOError` vs `PermissionError` | Distingue concurrencia real de fallos de permisos en disco, eliminando deadlocks operativos. |
+| **Desalojo Dinámico Iterativo** | `while free_space < umbral: borrar(); break si OK` | Recupera el margen de seguridad ($\ge 10\%$) en un solo ciclo horario sin acumulaciones crónicas. |
+| **Envoltura Protectora de Control de Espacio** | `try...except Exception as e:` | Previene abortos prematuros y asegura siempre el saneamiento del registro JSON. |
 | **Verificación DNS Real** | `socket.getaddrinfo("www.googleapis.com", 443)` | Evita falsos positivos de red cuando el gateway responde a IP pero DNS o WAN fallan. |
 | **Colas Prioritarias Desacopladas** | `event` (P1) → `mseed` (P2) → `continuous` (P3) | Sube prioritariamente datos sismológicos críticos antes que el flujo continuo masivo. |
 | **Procesamiento Acotado por Lotes** | `drive.config.batch_size` (default: 20) | Previene saturación de RAM por escaneo y carga de listas masivas de miles de archivos. |
-| **Pausa Anti-Bufferbloat** | `time.sleep(1.5)` | Evita saturar colas de subida de routers/módems celulares 3G/4G, previniendo latencia SSH inmanejable. |
-| **Recolección Forzada de Basura** | `gc.collect()` tras lotes de subida | Libera inmediatamente memoria acumulada por deserialización SSL y peticiones HTTP de `google-api-python-client`. |
-| **Protección de Binario Activo** | Lectura de `NombreArchivoRegistroContinuo.tmp` + delta `mtime < 2h` | Previene borrado o corrupción del archivo en escritura activa por `registro_continuo_4.5.0.c`. |
+| **Pausa Anti-Bufferbloat** | `time.sleep(1.5)` | Evita saturar colas de subida de routers/módems celulares 3G/4G. |
+| **Recolección Forzada de Basura** | `gc.collect()` tras lotes de subida | Libera inmediatamente memoria acumulada por deserialización SSL de Google Client API. |
+| **Protección de Binario Activo** | `obtener_archivos_activos_continuous()` | Previene borrado o subida del archivo en escritura activa por `registro_continuo_4.5.0.c`. |
 
 ---
 
@@ -126,7 +136,8 @@ graph TD
 
 | Función | Descripción |
 |---------|-------------|
-| `adquirir_cerrojo(lock_path)` | Adquiere candado exclusivo no bloqueante vía `fcntl.flock`. Cierra el descriptor en caso de contienda. |
+| `obtener_ruta_cerrojo()` | Resuelve la ruta del lockfile priorizando `$PROJECT_LOCAL_ROOT/tmp-files/` y recurriendo a `/tmp/gestor_archivos_acq_${USER}.lock`. |
+| `adquirir_cerrojo(lock_path=None, return_status=False)` | Adquiere candado exclusivo no bloqueante vía `fcntl.flock`. Discrimina `BlockingIOError` de `PermissionError`. |
 | `liberar_cerrojo(lock_fd)` | Desbloquea (`LOCK_UN`) y cierra el descriptor de archivo de forma segura. |
 | `obtener_archivos_activos_continuous(directorio, base_path)` | Retorna conjunto de nombres de archivos `.dat` activos (por archivo temporal del daemon C o mtime < 2h). |
 | `check_internet_connection(logger)` | Resuelve `www.googleapis.com:443` con timeout de 5 segundos. |
@@ -134,7 +145,7 @@ graph TD
 | `eliminar_archivo_con_verificacion(...)` | Verifica si el archivo está protegido o activo antes de invocar `os.remove()`. |
 | `limpiar_archivos_inexistentes(log_dir, dirs, logger)` | Sanea `uploaded_files_registry.json` eliminando claves huérfanas que ya no están en disco. |
 | `_ejecutar_gestor(args)` | Núcleo de ejecución del gestor desacoplado para gestión estricta del ciclo de vida del cerrojo. |
-| `main()` | Punto de entrada con control de argumentos CLI, adquisición de lock y liberación en `finally`. |
+| `main()` | Punto de entrada con control de argumentos CLI, adquisición de lock, manejo de códigos de salida (0 vs 1) y liberación en `finally`. |
 
 ---
 
@@ -153,7 +164,7 @@ Fragmento de configuración relevante:
       "online": {
         "subir": ["mseed", "event"],
         "retener_dias": {
-          "continuous": 30,
+          "continuous": 7,
           "mseed": 30,
           "event": 30
         }

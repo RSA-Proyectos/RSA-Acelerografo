@@ -1,7 +1,9 @@
 ---
 proyecto: acelerografo-DEV00
 tipo: diagnostico_tecnico
-resolucion: pendiente
+resolucion: resuelto
+adr: ADR-025
+blueprint: docs/blueprints/2026-10-19_plan_correccion_acumulacion_y_robustecimiento_gestor_sync.md
 temas: [drive, almacenamiento, espacio-disco, nameerror, retencion, acelerografo, dev00, tes00, flock, cerrojo, permisos]
 fecha: 2026-10-19
 ---
@@ -12,7 +14,7 @@ fecha: 2026-10-19
 **Proyecto / Repositorio**: `acelerografo-DEV00` (`RSA-Acelerografo`)  
 **Componente(s) afectado(s)**: `scripts/operation/drive/gestor_archivos_acq.py`, `configuration/configuracion_dispositivo.json`, `scripts/task/registrocontinuo.sh`  
 **Estación(es) bajo análisis**: `DEV00` (desarrollo) y `TES00` (testeo)  
-**Estado**: Diagnosticado (causas raíz localizadas con precisión de código y logs; pendiente implementación de corrección)  
+**Estado**: Resuelto (implementado y validado en producción en DEV00; documentado en ADR-025)  
 **Severidad**: Alta (riesgo inminente de parada de adquisición SPI y corrupción de sistema por llenado al 100% de la partición raíz `/dev/root`)  
 
 ---
