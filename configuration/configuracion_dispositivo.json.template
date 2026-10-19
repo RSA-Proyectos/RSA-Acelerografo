@@ -34,7 +34,7 @@
         "politicas": {
             "online": {
                 "subir": ["mseed", "event"],
-                "retener_dias": {"continuous": 30, "mseed": 30, "event": 30}
+                "retener_dias": {"continuous": 7, "mseed": 30, "event": 30}
             },
             "offline": {
                 "subir": [],
