@@ -24,11 +24,14 @@ mkdir -p $PROJECT_LOCAL_ROOT/scripts/acelerografo/libraries
 mkdir -p $PROJECT_LOCAL_ROOT/scripts/mseed
 mkdir -p $PROJECT_LOCAL_ROOT/scripts/mqtt
 mkdir -p $PROJECT_LOCAL_ROOT/scripts/drive
+mkdir -p $PROJECT_LOCAL_ROOT/scripts/export
 mkdir -p $PROJECT_LOCAL_ROOT/scripts/task
 mkdir -p $PROJECT_LOCAL_ROOT/scripts/web
+mkdir -p /home/rsa/data/packages
 
 # Asegurar que los directorios creados tengan la propiedad correcta (sin sudo)
 chown -R $USER:$USER $PROJECT_LOCAL_ROOT
+chown -R $USER:$USER /home/rsa/data/packages 2>/dev/null || true
 
 # Crea los archivos necesarios
 echo $(date) > $PROJECT_LOCAL_ROOT/resultados/registro-continuo/nueva-estacion.txt
@@ -40,6 +43,7 @@ touch $PROJECT_LOCAL_ROOT/log-files/gestor_acq.log
 touch $PROJECT_LOCAL_ROOT/log-files/mqtt.log
 touch $PROJECT_LOCAL_ROOT/log-files/mseed.log
 touch $PROJECT_LOCAL_ROOT/log-files/registro_continuo.log
+touch $PROJECT_LOCAL_ROOT/log-files/empaquetar.log
 
 # Copiar la configuración maestra y las plantillas al proyecto local
 cp $PROJECT_GIT_ROOT/configuration/configuracion_maestra.json $PROJECT_LOCAL_ROOT/configuracion/
@@ -53,6 +57,7 @@ cp $PROJECT_GIT_ROOT/scripts/operation/structured_logger.py $PROJECT_LOCAL_ROOT/
 cp $PROJECT_GIT_ROOT/scripts/operation/mqtt/*.py $PROJECT_LOCAL_ROOT/scripts/mqtt/
 cp $PROJECT_GIT_ROOT/scripts/operation/mseed/*.py $PROJECT_LOCAL_ROOT/scripts/mseed/
 cp $PROJECT_GIT_ROOT/scripts/operation/drive/*.py $PROJECT_LOCAL_ROOT/scripts/drive/
+cp $PROJECT_GIT_ROOT/scripts/operation/export/*.py $PROJECT_LOCAL_ROOT/scripts/export/
 cp -r $PROJECT_GIT_ROOT/scripts/operation/web/. $PROJECT_LOCAL_ROOT/scripts/web/
 
 # Crear el entorno virtual e instalar dependencias Python
