@@ -350,31 +350,30 @@ class TestProcesarYSubirPendientes(unittest.TestCase):
         args, kwargs = mock_subir.call_args
         self.assertTrue(kwargs.get("borrar_despues"))
 
-    @patch("procesar_y_subir_pendientes.ya_fue_subido")
     @patch("procesar_y_subir_pendientes.nombrar_archivo_mseed")
     @patch("procesar_y_subir_pendientes.extraer_tiempo_binario")
-    def test_purgar_binarios_respaldados(self, mock_extraer, mock_nombrar, mock_subido):
+    def test_purgar_binarios_respaldados(self, mock_extraer, mock_nombrar):
         """
-        Verifica en DEV0:
-        1. Elimina .dat cuyo .mseed ya consta como subido en Drive.
-        2. Protege el archivo activo en grabación SPI.
-        3. Conserva .dat cuyo .mseed aún no ha sido subido.
+        Verifica en DEV0 (desacoplado de Google Drive):
+        1. Elimina .dat cuyo .mseed correspondiente ya existe localmente con tamaño > 0.
+        2. Protege incondicionalmente el archivo activo en grabación SPI.
+        3. Conserva .dat cuyo .mseed aún no existe localmente.
         """
         f_activo = os.path.join(self.rc_dir, "DEV00_261013-100000.dat")
-        f_subido = os.path.join(self.rc_dir, "DEV00_261013-080000.dat")
-        f_no_subido = os.path.join(self.rc_dir, "DEV00_261013-090000.dat")
+        f_con_mseed = os.path.join(self.rc_dir, "DEV00_261013-080000.dat")
+        f_sin_mseed = os.path.join(self.rc_dir, "DEV00_261013-090000.dat")
 
-        for f in [f_activo, f_subido, f_no_subido]:
+        for f in [f_activo, f_con_mseed, f_sin_mseed]:
             with open(f, "wb") as fh:
                 fh.write(b"\x00" * 2506)
 
+        # Crear el .mseed local para 080000
+        mseed_local = os.path.join(self.ms_dir, "DEV0_20261013_080000.mseed")
+        with open(mseed_local, "wb") as fh:
+            fh.write(b"MSEED_DATA_BYTES")
+
         mock_extraer.return_value = {"anio": 2026, "mes": 10, "dia": 13, "hora": 8, "minuto": 0, "segundo": 0}
-        mock_nombrar.side_effect = lambda est, t: "DEV0_20261013_080000.mseed" if "080000" in mock_nombrar.curr else "DEV0_20261013_090000.mseed"
-
-        def fake_subido(log_dir, fname, tipo):
-            return "080000" in fname
-
-        mock_subido.side_effect = fake_subido
+        mock_nombrar.side_effect = lambda est, t: "DEV0_20261013_080000.mseed" if "080000" in getattr(mock_nombrar, "curr", "") else "DEV0_20261013_090000.mseed"
 
         def fake_extraer(fpath, usar_f):
             mock_nombrar.curr = fpath
@@ -386,7 +385,7 @@ class TestProcesarYSubirPendientes(unittest.TestCase):
         resumen = psp.purgar_binarios_respaldados(
             path_registro_continuo=self.rc_dir,
             codigo_estacion="DEV0",
-            log_directory=self.log_dir,
+            path_archivos_mseed=self.ms_dir,
             archivos_activos=archivos_activos,
             logger=MagicMock(),
             usar_fecha_filename=False,
@@ -396,12 +395,131 @@ class TestProcesarYSubirPendientes(unittest.TestCase):
         self.assertEqual(resumen["total_evaluados"], 3)
         self.assertEqual(resumen["omitidos_activos"], 1)
         self.assertEqual(resumen["purgados"], 1)
-        self.assertEqual(resumen["omitidos_no_subidos"], 1)
+        self.assertEqual(resumen["omitidos_sin_mseed"], 1)
 
         # Comprobar el estado real en disco
         self.assertTrue(os.path.exists(f_activo))
-        self.assertTrue(os.path.exists(f_no_subido))
-        self.assertFalse(os.path.exists(f_subido))
+        self.assertTrue(os.path.exists(f_sin_mseed))
+        self.assertFalse(os.path.exists(f_con_mseed))
+
+    # ------------------------------------------------------------------------
+    # 8. Pruebas de Guarda Preventiva de Espacio y Flags Unificados
+    # ------------------------------------------------------------------------
+    @patch("shutil.disk_usage")
+    def test_verificar_espacio_libre(self, mock_usage):
+        """Verifica la lógica de cálculo de espacio porcentual y absoluto."""
+        # 100 GB total, 50 GB usado, 50 GB libre (50%, 51200 MB) -> Suficiente
+        mock_usage.return_value = (100 * 1024**3, 50 * 1024**3, 50 * 1024**3)
+        suficiente, pct, mb = psp.verificar_espacio_libre("/dummy", umbral_minimo_pct=10.0, min_mb_libres=500.0)
+        self.assertTrue(suficiente)
+        self.assertAlmostEqual(pct, 50.0)
+
+        # 100 GB total, 95 GB usado, 5 GB libre (5%, 5120 MB) -> Falla por porcentaje (<10%)
+        mock_usage.return_value = (100 * 1024**3, 95 * 1024**3, 5 * 1024**3)
+        suficiente, pct, mb = psp.verificar_espacio_libre("/dummy", umbral_minimo_pct=10.0, min_mb_libres=500.0)
+        self.assertFalse(suficiente)
+
+        # 1 GB total, 0.7 GB usado, 0.3 GB libre (30%, 307 MB) -> Falla por MB libres (<500 MB)
+        mock_usage.return_value = (1024 * 1024**2, 700 * 1024**2, 324 * 1024**2)
+        suficiente, pct, mb = psp.verificar_espacio_libre("/dummy", umbral_minimo_pct=10.0, min_mb_libres=500.0)
+        self.assertFalse(suficiente)
+
+    @patch("procesar_y_subir_pendientes.verificar_espacio_libre")
+    @patch("procesar_y_subir_pendientes.procesar_archivo_individual")
+    @patch("procesar_y_subir_pendientes.extraer_tiempo_binario")
+    @patch("procesar_y_subir_pendientes.nombrar_archivo_mseed")
+    def test_convertir_archivos_pendientes_guarda_espacio(
+        self, mock_nombrar, mock_extraer, mock_procesar, mock_espacio
+    ):
+        """Verifica que la conversión se aborta preventivamente si el espacio libre es <10%."""
+        f_dat = os.path.join(self.rc_dir, "DEV00_261013-090000.dat")
+        with open(f_dat, "wb") as fh:
+            fh.write(b"\x00" * 2506)
+
+        mock_extraer.return_value = {"anio": 2026, "mes": 10, "dia": 13, "hora": 9, "minuto": 0, "segundo": 0}
+        mock_nombrar.return_value = "DEV0_20261013_090000.mseed"
+        # Simular espacio insuficiente (<10%)
+        mock_espacio.return_value = (False, 8.5, 420.0)
+
+        resumen = psp.convertir_archivos_pendientes(
+            path_registro_continuo=self.rc_dir,
+            path_archivos_mseed=self.ms_dir,
+            codigo_estacion="DEV0",
+            config_mseed={"CODIGO(1)": "DEV0"},
+            archivos_activos=set(),
+            logger=MagicMock(),
+            purge_dat=False,
+            dry_run=False
+        )
+
+        self.assertTrue(resumen["abortado_por_espacio"])
+        self.assertEqual(resumen["convertidos_exitosos"], 0)
+        mock_procesar.assert_not_called()
+
+    @patch("procesar_y_subir_pendientes.procesar_archivo_individual")
+    @patch("procesar_y_subir_pendientes.extraer_tiempo_binario")
+    @patch("procesar_y_subir_pendientes.nombrar_archivo_mseed")
+    def test_convertir_archivos_pendientes_purga_inmediata(
+        self, mock_nombrar, mock_extraer, mock_procesar
+    ):
+        """Verifica que si purge_dat=True, el .dat se elimina inmediatamente tras generarse el .mseed."""
+        f_dat = os.path.join(self.rc_dir, "DEV00_261013-090000.dat")
+        with open(f_dat, "wb") as fh:
+            fh.write(b"\x00" * 2506)
+
+        mseed_esperado = os.path.join(self.ms_dir, "DEV0_20261013_090000.mseed")
+
+        def fake_procesar(*args, **kwargs):
+            # Simular la creación del .mseed en disco por binary_to_mseed
+            with open(mseed_esperado, "wb") as fh:
+                fh.write(b"MSEED_DATA")
+            return (True, "OK", {"tiempo_lectura": 0.25})
+
+        mock_procesar.side_effect = fake_procesar
+        mock_extraer.return_value = {"anio": 2026, "mes": 10, "dia": 13, "hora": 9, "minuto": 0, "segundo": 0}
+        mock_nombrar.return_value = "DEV0_20261013_090000.mseed"
+
+        resumen = psp.convertir_archivos_pendientes(
+            path_registro_continuo=self.rc_dir,
+            path_archivos_mseed=self.ms_dir,
+            codigo_estacion="DEV0",
+            config_mseed={"CODIGO(1)": "DEV0"},
+            archivos_activos=set(),
+            logger=MagicMock(),
+            purge_dat=True,
+            dry_run=False
+        )
+
+        self.assertEqual(resumen["convertidos_exitosos"], 1)
+        self.assertEqual(resumen["purgados_inmediatos"], 1)
+        # El .mseed debe existir y el .dat debe haberse purgado
+        self.assertTrue(os.path.exists(mseed_esperado))
+        self.assertFalse(os.path.exists(f_dat))
+
+    def test_flags_unificados_y_retrocompatibilidad(self):
+        """Verifica que los flags en inglés y los alias en español sean parseados correctamente."""
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--convert-only", dest="convert_only", action="store_true")
+        parser.add_argument("--solo-convertir", dest="convert_only", action="store_true")
+        parser.add_argument("--upload-only", dest="upload_only", action="store_true")
+        parser.add_argument("--solo-subir", dest="upload_only", action="store_true")
+        parser.add_argument("--purge-dat", action="store_true")
+
+        args1 = parser.parse_args(["--convert-only", "--purge-dat"])
+        self.assertTrue(args1.convert_only)
+        self.assertTrue(args1.purge_dat)
+        self.assertFalse(args1.upload_only)
+
+        args2 = parser.parse_args(["--solo-convertir"])
+        self.assertTrue(args2.convert_only)
+
+        args3 = parser.parse_args(["--upload-only"])
+        self.assertTrue(args3.upload_only)
+        self.assertFalse(args3.convert_only)
+
+        args4 = parser.parse_args(["--solo-subir"])
+        self.assertTrue(args4.upload_only)
 
 
 # ============================================================================

@@ -17,8 +17,9 @@ DESCRIPCIÓN:
 
 USO:
     python3 procesar_y_subir_pendientes.py                    # Conversión y subida (lote de 20)
-    python3 procesar_y_subir_pendientes.py --solo-convertir   # Solo conversión local de .dat a .mseed
-    python3 procesar_y_subir_pendientes.py --solo-subir       # Solo subida de .mseed/eventos a Drive
+    python3 procesar_y_subir_pendientes.py --convert-only     # Solo conversión local de .dat a .mseed
+    python3 procesar_y_subir_pendientes.py --upload-only      # Solo subida de .mseed/eventos a Drive
+    python3 procesar_y_subir_pendientes.py --purge-dat        # Purga .dat con .mseed local verificado
     python3 procesar_y_subir_pendientes.py --dry-run          # Simulación y diagnóstico sin escrituras
     python3 procesar_y_subir_pendientes.py --batch-size 10    # Subir un lote de máximo 10 archivos
     python3 procesar_y_subir_pendientes.py --all              # Subir todos los archivos pendientes
@@ -32,6 +33,7 @@ import fcntl
 import json
 import gc
 import glob
+import shutil
 import argparse
 from datetime import datetime
 
@@ -146,6 +148,22 @@ def liberar_cerrojo(lock_fd):
             pass
 
 
+def verificar_espacio_libre(directorio, umbral_minimo_pct=10.0, min_mb_libres=500.0):
+    """
+    Verifica si el espacio libre en disco supera el umbral porcentual y absoluto mínimo.
+    Retorna: (suficiente: bool, free_pct: float, free_mb: float)
+    """
+    try:
+        target = directorio if (directorio and os.path.exists(directorio)) else "/"
+        total, used, free = shutil.disk_usage(target)
+        free_pct = (free / total) * 100.0
+        free_mb = free / (1024 * 1024)
+        suficiente = (free_pct >= umbral_minimo_pct) and (free_mb >= min_mb_libres)
+        return suficiente, free_pct, free_mb
+    except Exception:
+        return True, 100.0, 99999.0
+
+
 # ============================================================================
 # FASE 1: CONVERSIÓN LOCAL DE ARCHIVOS BINARIOS PENDIENTES
 # ============================================================================
@@ -190,12 +208,14 @@ def convertir_archivos_pendientes(
     logger,
     usar_fecha_filename=False,
     max_convertir=None,
+    purge_dat=False,
     dry_run=False
 ):
     """
     Convierte secuencialmente archivos binarios .dat no convertidos a .mseed.
     Es 100% idempotente: si el .mseed ya existe en disco, se omite de inmediato.
     Si se especifica max_convertir (int), se detiene al alcanzar dicho cupo.
+    Incorpora guarda preventiva de espacio libre y purga inmediata de .dat si purge_dat=True.
     """
     resumen = {
         "total_dat": 0,
@@ -203,7 +223,9 @@ def convertir_archivos_pendientes(
         "ya_convertidos": 0,
         "convertidos_exitosos": 0,
         "fallidos": 0,
-        "detalles_fallidos": []
+        "detalles_fallidos": [],
+        "abortado_por_espacio": False,
+        "purgados_inmediatos": 0
     }
 
     if not os.path.isdir(path_registro_continuo):
@@ -251,10 +273,26 @@ def convertir_archivos_pendientes(
             resumen["ya_convertidos"] += 1
             continue
 
-        # 4. Archivo pendiente de conversión
+        # 4. Guarda preventiva de espacio libre en disco
+        umbral_pct = 5.0 if purge_dat else 10.0
+        umbral_mb = 250.0 if purge_dat else 500.0
+        espacio_ok, free_pct, free_mb = verificar_espacio_libre(path_archivos_mseed, umbral_pct, umbral_mb)
+        if not espacio_ok:
+            msg = (
+                f"\n  [ERROR ESPACIO] Espacio en disco insuficiente: {free_pct:.2f}% "
+                f"({free_mb:.1f} MB libres). Abortando conversión para proteger adquisición SPI."
+            )
+            print(msg)
+            if logger:
+                logger.error("disk_space", msg)
+            resumen["abortado_por_espacio"] = True
+            break
+
+        # 5. Archivo pendiente de conversión
         if dry_run:
             resumen["convertidos_exitosos"] += 1
-            print(f"  [DRY-RUN] Se convertiría: {binary_filename} ──> {mseed_filename}")
+            del_msg = " [y se purgaría .dat]" if purge_dat else ""
+            print(f"  [DRY-RUN] Se convertiría: {binary_filename} ──> {mseed_filename}{del_msg}")
         else:
             print(f"  [CONVIRTIENDO] {binary_filename} ──> {mseed_filename} ...", end="", flush=True)
             exito, mensaje, info = procesar_archivo_individual(
@@ -269,7 +307,22 @@ def convertir_archivos_pendientes(
             if exito:
                 resumen["convertidos_exitosos"] += 1
                 tiempo_seg = info['tiempo_lectura'] if info else 0.0
-                print(f" OK ({tiempo_seg:.2f}s)")
+                print(f" OK ({tiempo_seg:.2f}s)", end="")
+
+                # Si purge_dat está activo, purgar el .dat inmediatamente tras verificar .mseed
+                if purge_dat and binary_filename not in archivos_activos:
+                    try:
+                        mseed_verif = os.path.join(path_archivos_mseed, mseed_filename)
+                        if os.path.isfile(mseed_verif) and os.path.getsize(mseed_verif) > 0:
+                            os.remove(binary_file)
+                            resumen["purgados_inmediatos"] += 1
+                            print(" [PURGADO .DAT]", end="")
+                            if logger:
+                                logger.info(f"Binario .dat purgado inmediatamente tras conversión: {binary_filename}")
+                    except Exception as e:
+                        if logger:
+                            logger.error("purge_error", f"Error al purgar {binary_filename} tras conversión: {e}")
+                print()
                 gc.collect()  # Liberar memoria de numpy/obspy
             else:
                 resumen["fallidos"] += 1
@@ -448,31 +501,45 @@ def subir_archivos_pendientes(
 
 
 # ============================================================================
-# FASE 3: PURGA DE BINARIOS .DAT RESPALDADOS EN GOOGLE DRIVE
+# FASE 3: PURGA DE BINARIOS .DAT CON MINISEED LOCAL VERIFICADO
 # ============================================================================
 def purgar_binarios_respaldados(
     path_registro_continuo,
     codigo_estacion,
-    log_directory,
-    archivos_activos,
-    logger,
+    path_archivos_mseed=None,
+    archivos_activos=None,
+    logger=None,
     usar_fecha_filename=False,
-    dry_run=False
+    dry_run=False,
+    log_directory=None
 ):
     """
-    Elimina archivos binarios .dat cuyo miniSEED correspondiente ya fue subido
-    exitosamente a Google Drive (confirmado en uploaded_files_registry.json).
+    Elimina archivos binarios .dat cuyo miniSEED correspondiente ya existe
+    localmente en disco con tamaño > 0.
+    Desacoplado de Google Drive para permitir depuración de almacenamiento offline.
     Protege incondicionalmente el archivo activo en grabación SPI.
     """
     resumen = {
         "total_evaluados": 0,
         "purgados": 0,
         "omitidos_activos": 0,
+        "omitidos_sin_mseed": 0,
         "omitidos_no_subidos": 0
     }
 
+    if archivos_activos is None:
+        archivos_activos = set()
+
+    # Si no se pasó path_archivos_mseed pero sí log_directory (retrocompatibilidad)
+    if not path_archivos_mseed and log_directory:
+        base_parent = os.path.dirname(os.path.abspath(log_directory.rstrip("/")))
+        posible_mseed = os.path.join(base_parent, "mseed")
+        if os.path.isdir(posible_mseed):
+            path_archivos_mseed = posible_mseed
+
     if not os.path.isdir(path_registro_continuo):
-        logger.warning(f"Directorio de registro continuo no existe para purga: {path_registro_continuo}")
+        if logger:
+            logger.warning(f"Directorio de registro continuo no existe para purga: {path_registro_continuo}")
         return resumen
 
     archivos_dat = sorted(glob.glob(os.path.join(path_registro_continuo, "*.dat")))
@@ -490,25 +557,31 @@ def purgar_binarios_respaldados(
         tiempo_binario = extraer_tiempo_binario(binary_file, usar_fecha_filename)
         if tiempo_binario is None:
             # Archivo dañado o sin tiempo determinable: no purgar automáticamente
+            resumen["omitidos_sin_mseed"] += 1
+            resumen["omitidos_no_subidos"] += 1
             continue
 
         mseed_filename = nombrar_archivo_mseed(codigo_estacion, tiempo_binario)
+        mseed_path = os.path.join(path_archivos_mseed, mseed_filename) if path_archivos_mseed else None
 
-        # 3. Verificar si el miniSEED ya consta como subido exitosamente en Drive
-        if ya_fue_subido(log_directory, mseed_filename, "mseed"):
+        # 3. Verificar si el miniSEED existe localmente y tiene tamaño mayor a cero
+        if mseed_path and os.path.isfile(mseed_path) and os.path.getsize(mseed_path) > 0:
             if dry_run:
-                print(f"  [DRY-RUN] Se purgaría .dat respaldado: {binary_filename} (confirmado en Drive: {mseed_filename})")
+                print(f"  [DRY-RUN] Se purgaría .dat (miniSEED local verificado): {binary_filename} (existe: {mseed_filename})")
                 resumen["purgados"] += 1
             else:
                 try:
                     os.remove(binary_file)
                     resumen["purgados"] += 1
-                    logger.info(f"Binario .dat purgado tras confirmar subida a Drive: {binary_filename}")
-                    print(f"  [PURGADO] {binary_filename} (confirmado en Drive: {mseed_filename})")
+                    if logger:
+                        logger.info(f"Binario .dat purgado tras verificar miniSEED local: {binary_filename}")
+                    print(f"  [PURGADO] {binary_filename} (miniSEED verificado: {mseed_filename})")
                 except Exception as e:
-                    logger.error("purge_error", f"No se pudo eliminar {binary_filename}: {e}")
+                    if logger:
+                        logger.error("purge_error", f"No se pudo eliminar {binary_filename}: {e}")
                     print(f"  [ERROR AL PURGAR] {binary_filename}: {e}")
         else:
+            resumen["omitidos_sin_mseed"] += 1
             resumen["omitidos_no_subidos"] += 1
 
     return resumen
@@ -522,14 +595,28 @@ def main():
         description="Conversión y Subida Resiliente de Archivos Pendientes (acelerógrafo DEV00)"
     )
     parser.add_argument(
-        "--solo-convertir",
+        "--convert-only",
+        dest="convert_only",
         action="store_true",
         help="Ejecuta exclusivamente la Fase 1 (conversión local de binarios a miniSEED)"
     )
     parser.add_argument(
-        "--solo-subir",
+        "--solo-convertir",
+        dest="convert_only",
+        action="store_true",
+        help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--upload-only",
+        dest="upload_only",
         action="store_true",
         help="Ejecuta exclusivamente la Fase 2 (subida resiliente a Google Drive)"
+    )
+    parser.add_argument(
+        "--solo-subir",
+        dest="upload_only",
+        action="store_true",
+        help=argparse.SUPPRESS
     )
     parser.add_argument(
         "--dry-run",
@@ -557,7 +644,7 @@ def main():
         "--purge-dat",
         action="store_true",
         default=False,
-        help="Elimina archivos binarios .dat cuyo miniSEED ya consta como subido exitosamente a Drive"
+        help="Elimina archivos binarios .dat cuyo miniSEED correspondiente ya existe localmente con tamaño > 0"
     )
     parser.add_argument(
         "--verbosity",
@@ -567,6 +654,15 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Advertencias de retrocompatibilidad y mapeo de alias
+    if "--solo-convertir" in sys.argv:
+        print("[AVISO] El flag '--solo-convertir' está en desuso. Use '--convert-only'.")
+    if "--solo-subir" in sys.argv:
+        print("[AVISO] El flag '--solo-subir' está en desuso. Use '--upload-only'.")
+
+    args.solo_convertir = args.convert_only
+    args.solo_subir = args.upload_only
 
     # 1. Cerrojo atómico para impedir concurrencia
     lock_fd = adquirir_cerrojo()
@@ -618,28 +714,8 @@ def main():
         print(f"  Modo: {'[SIMULACIÓN DRY-RUN]' if args.dry_run else '[EJECUCIÓN REAL]'}")
         print("=" * 65)
 
-        # 3. VERIFICACIÓN PREVIA DE DNS (FAIL-FAST)
-        dns_ok_previo = False
-        if not args.solo_convertir:
-            print("\n[VERIFICACIÓN PREVIA DNS] Comprobando conectividad con Google Drive...")
-            dns_ok_previo = verificar_dns_drive()
-            if not dns_ok_previo:
-                msg = (
-                    "[FAIL-FAST DNS] No es posible resolver 'www.googleapis.com'.\n"
-                    "El servidor DNS corporativo no responde o no resuelve dominios de Google.\n"
-                    "Aviso: Se omite la conversión y la subida para proteger el almacenamiento en disco y la RAM.\n"
-                    "Los archivos binarios .dat se mantienen resguardados localmente (>90 días de autonomía)."
-                )
-                print(f"  FALLÓ.\n\n{msg}\n")
-                logger.warning(msg)
-                print("=" * 65)
-                print("  Proceso finalizado preventivamente por indisponibilidad de DNS.")
-                print("=" * 65 + "\n")
-                return
-            print("  Resolución DNS: OK (servicios de Google disponibles).")
-
-        # 4. FASE 1: Conversión Local de Binarios Pendientes con Cupo Dinámico
-        if not args.solo_subir:
+        # 3. FASE 1: Conversión Local de Binarios Pendientes con Cupo Dinámico
+        if not args.upload_only:
             print("\n[FASE 1] Conversión Local de Archivos Binarios a miniSEED:")
             activos = obtener_archivos_activos(local_root, path_rc)
             if activos:
@@ -648,7 +724,7 @@ def main():
             # Cálculo de retro-presión: sincronizar conversiones con archivos en cola de subida
             max_a_convertir = None
             if not args.all and args.batch_size > 0:
-                if args.solo_convertir:
+                if args.convert_only:
                     max_a_convertir = args.batch_size
                     print(f"  [MODO SOLO CONVERSIÓN] Lote máximo a convertir: {max_a_convertir} archivo(s).")
                 else:
@@ -670,6 +746,7 @@ def main():
                 logger=logger,
                 usar_fecha_filename=usar_fecha_filename,
                 max_convertir=max_a_convertir,
+                purge_dat=args.purge_dat,
                 dry_run=args.dry_run
             )
 
@@ -678,48 +755,66 @@ def main():
             print(f"  Excluidos (activos)     : {res_conv['excluidos_activos']}")
             print(f"  Omitidos (ya convertidos): {res_conv['ya_convertidos']}")
             print(f"  Convertidos con éxito   : {res_conv['convertidos_exitosos']}")
+            if args.purge_dat:
+                print(f"  Purgados inmediatamente : {res_conv.get('purgados_inmediatos', 0)}")
             print(f"  Fallidos                : {res_conv['fallidos']}")
+            if res_conv.get("abortado_por_espacio"):
+                print("  ALERTA: Conversión detenida preventivamente por límite de espacio en disco (<10%).")
 
-        # 5. FASE 2: Subida Resiliente a Google Drive
-        if not args.solo_convertir:
+        # 4. FASE 2: Subida Resiliente a Google Drive
+        if not args.convert_only:
             print("\n[FASE 2] Subida Controlada a Google Drive:")
-            res_sub = subir_archivos_pendientes(
-                local_root=local_root,
-                config_dispositivo=config_dispositivo,
-                log_directory=log_dir,
-                logger=logger,
-                batch_size=args.batch_size,
-                all_files=args.all,
-                dns_verificado=dns_ok_previo,
-                delete_uploaded=args.delete_uploaded,
-                dry_run=args.dry_run
-            )
+            print("  Comprobando conectividad con Google Drive (resolución DNS)...")
+            dns_ok = verificar_dns_drive()
+            if not dns_ok:
+                msg = (
+                    "[FAIL-FAST DNS] No es posible resolver 'www.googleapis.com'.\n"
+                    "El servidor DNS corporativo no responde o no resuelve dominios de Google.\n"
+                    "Aviso: Se omite la fase de subida a Drive para proteger la memoria RAM.\n"
+                    "Los archivos miniSEED convertidos se mantienen resguardados en almacenamiento local (>90 días de autonomía)."
+                )
+                print(f"  FALLÓ.\n\n{msg}\n")
+                logger.warning(msg)
+            else:
+                print("  Resolución DNS: OK (servicios de Google disponibles).")
+                res_sub = subir_archivos_pendientes(
+                    local_root=local_root,
+                    config_dispositivo=config_dispositivo,
+                    log_directory=log_dir,
+                    logger=logger,
+                    batch_size=args.batch_size,
+                    all_files=args.all,
+                    dns_verificado=True,
+                    delete_uploaded=args.delete_uploaded,
+                    dry_run=args.dry_run
+                )
 
-            print("\n  --- Resumen de Subida a Drive ---")
-            print(f"  Resolución DNS Google  : {'OK' if res_sub['dns_ok'] else 'FALLÓ (corporativo)'}")
-            print(f"  Total pendientes cola  : {res_sub['total_pendientes']}")
-            print(f"  Subidos exitosamente   : {res_sub['subidos_exitosos']}")
-            print(f"  Fallidos en lote       : {res_sub['subidos_fallidos']}")
-            print(f"  Estado de finalización : {res_sub['status']}")
+                print("\n  --- Resumen de Subida a Drive ---")
+                print(f"  Resolución DNS Google  : {'OK' if res_sub['dns_ok'] else 'FALLÓ (corporativo)'}")
+                print(f"  Total pendientes cola  : {res_sub['total_pendientes']}")
+                print(f"  Subidos exitosamente   : {res_sub['subidos_exitosos']}")
+                print(f"  Fallidos en lote       : {res_sub['subidos_fallidos']}")
+                print(f"  Estado de finalización : {res_sub['status']}")
 
-        # 6. FASE 3: Purga de Binarios .dat Respaldados en Drive (si se solicita --purge-dat)
+        # 5. FASE 3: Purga de Binarios .dat con miniSEED Local Verificado
         if args.purge_dat:
-            print("\n[FASE 3] Purga de Archivos Binarios .dat Respaldados en Google Drive:")
+            print("\n[FASE 3] Purga de Archivos Binarios .dat con miniSEED Local Verificado:")
             activos = obtener_archivos_activos(local_root, path_rc)
             res_purge = purgar_binarios_respaldados(
                 path_registro_continuo=path_rc,
                 codigo_estacion=codigo_estacion,
-                log_directory=log_dir,
+                path_archivos_mseed=path_ms,
                 archivos_activos=activos,
                 logger=logger,
                 usar_fecha_filename=usar_fecha_filename,
-                dry_run=args.dry_run
+                dry_run=args.dry_run,
+                log_directory=log_dir
             )
             print("\n  --- Resumen de Purga de Binarios .dat ---")
             print(f"  Total .dat evaluados : {res_purge['total_evaluados']}")
             print(f"  Purgados con éxito   : {res_purge['purgados']}")
             print(f"  Omitidos (activos)   : {res_purge['omitidos_activos']}")
-            print(f"  Omitidos (no subidos): {res_purge['omitidos_no_subidos']}")
+            print(f"  Omitidos (sin mseed) : {res_purge['omitidos_sin_mseed']}")
 
         print("\n" + "=" * 65)
         print("  Proceso completado satisfactoriamente.")

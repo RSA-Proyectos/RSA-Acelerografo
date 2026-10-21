@@ -99,8 +99,14 @@ PROJECT_GIT_ROOT=$PROJECT_GIT_ROOT PROJECT_LOCAL_ROOT=$PROJECT_LOCAL_ROOT python
 update_files_if_changed "$PROJECT_GIT_ROOT/scripts/operation/mqtt/" "$PROJECT_LOCAL_ROOT/scripts/mqtt/"
 update_files_if_changed "$PROJECT_GIT_ROOT/scripts/operation/mseed/" "$PROJECT_LOCAL_ROOT/scripts/mseed/"
 update_files_if_changed "$PROJECT_GIT_ROOT/scripts/operation/drive/" "$PROJECT_LOCAL_ROOT/scripts/drive/"
+mkdir -p "$PROJECT_LOCAL_ROOT/scripts/export"
+update_files_if_changed "$PROJECT_GIT_ROOT/scripts/operation/export/" "$PROJECT_LOCAL_ROOT/scripts/export/"
 mkdir -p "$PROJECT_LOCAL_ROOT/scripts/acelerografo"
 update_files_if_changed "$PROJECT_GIT_ROOT/scripts/operation/acelerografo/" "$PROJECT_LOCAL_ROOT/scripts/acelerografo/"
+
+# Asegurar directorio de paquetes para exportación SFTP
+mkdir -p /home/rsa/data/packages 2>/dev/null || true
+touch "$PROJECT_LOCAL_ROOT/log-files/empaquetar.log" 2>/dev/null || true
 
 # Actualizar nuevos módulos core y streaming
 mkdir -p "$PROJECT_LOCAL_ROOT/scripts/core"
