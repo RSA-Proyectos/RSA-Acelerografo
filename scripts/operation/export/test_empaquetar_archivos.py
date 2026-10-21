@@ -93,6 +93,29 @@ class TestEmpaquetarArchivos(unittest.TestCase):
 
         self.assertFalse(emp.verificar_integridad_tar(tar_corrupto))
 
+    def test_verificar_integridad_y_sha256(self):
+        """Verifica la función unificada de integridad y cálculo de hash SHA-256."""
+        tar_valido = os.path.join(self.test_dir, "valido2.tar.gz")
+        f_content = os.path.join(self.test_dir, "f2.txt")
+        with open(f_content, "w") as f:
+            f.write("contenido optimizado unificado")
+
+        with tarfile.open(tar_valido, "w:gz") as tar:
+            tar.add(f_content, arcname="f2.txt")
+
+        es_valido, sha_hex = emp.verificar_integridad_y_sha256(tar_valido)
+        self.assertTrue(es_valido)
+        self.assertEqual(sha_hex, emp.calcular_sha256(tar_valido))
+
+        # Archivo corrupto
+        tar_corrupto = os.path.join(self.test_dir, "corrupto2.tar.gz")
+        with open(tar_corrupto, "wb") as f:
+            f.write(b"CORRUPCION_GZIP")
+
+        es_valido_c, sha_hex_c = emp.verificar_integridad_y_sha256(tar_corrupto)
+        self.assertFalse(es_valido_c)
+        self.assertIsNone(sha_hex_c)
+
     # ------------------------------------------------------------------------
     # 2. Pruebas de Empaquetado Diario, Checksum GNU y Purga de Fuentes
     # ------------------------------------------------------------------------

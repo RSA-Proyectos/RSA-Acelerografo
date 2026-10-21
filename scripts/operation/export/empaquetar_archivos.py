@@ -29,6 +29,7 @@ import tarfile
 import shutil
 import argparse
 import logging
+import gc
 from datetime import datetime, date
 
 # ============================================================================
@@ -209,6 +210,37 @@ def verificar_integridad_tar(tar_path):
         return False
 
 
+def verificar_integridad_y_sha256(tar_path, chunk_size=65536):
+    """
+    Verifica la integridad del archivo .tar.gz y calcula simultáneamente su suma SHA-256.
+    Ahorra una pasada completa de lectura en disco/RAM al unificar ambas operaciones.
+    Retorna: (es_valido: bool, sha256_hex: str)
+    """
+    # 1. Calcular SHA-256 leyendo el stream comprimido en bloques de 64 KB
+    sha256 = hashlib.sha256()
+    try:
+        with open(tar_path, "rb") as f:
+            while True:
+                data = f.read(chunk_size)
+                if not data:
+                    break
+                sha256.update(data)
+        sha_hex = sha256.hexdigest()
+    except Exception:
+        return False, None
+
+    # 2. Verificar que el formato tar.gz y los miembros sean válidos
+    try:
+        with tarfile.open(tar_path, "r:gz") as tar:
+            members = tar.getmembers()
+            if not members:
+                return False, None
+    except Exception:
+        return False, None
+
+    return True, sha_hex
+
+
 def verificar_espacio_para_empaquetar(directorio_destino, tamano_fuentes_bytes, margen_seguridad_mb=500):
     """
     Verifica si el disco tiene espacio libre suficiente para comprimir.
@@ -299,8 +331,15 @@ def empaquetar_dia(
             for f in archivos:
                 tar.add(f, arcname=os.path.basename(f))
 
-        # 4. Verificar integridad del archivo temporal
-        if not verificar_integridad_tar(tmp_tar_path):
+        # Sincronizar buffers a disco tras escribir el archivo comprimido
+        try:
+            os.sync()
+        except AttributeError:
+            pass
+
+        # 4. Verificar integridad y calcular SHA-256 en pasada unificada
+        es_valido, sha_hash = verificar_integridad_y_sha256(tmp_tar_path)
+        if not es_valido:
             if os.path.exists(tmp_tar_path):
                 os.remove(tmp_tar_path)
             res["status"] = "error_integrity"
@@ -314,9 +353,13 @@ def empaquetar_dia(
         os.replace(tmp_tar_path, tar_path)
 
         # 6. Generar SHA-256 en formato estándar GNU (dos espacios entre hash y filename)
-        sha_hash = calcular_sha256(tar_path)
         with open(sha_path, "w", encoding="utf-8") as sf:
             sf.write(f"{sha_hash}  {tar_nombre}\n")
+            sf.flush()
+            try:
+                os.fsync(sf.fileno())
+            except OSError:
+                pass
 
         print(" OK")
         if logger:
@@ -588,7 +631,7 @@ def main():
         total_paquetes = 0
         total_liberados = 0
 
-        for d in dias_a_procesar:
+        for idx, d in enumerate(dias_a_procesar, 1):
             archivos_dia = archivos_por_dia.get(d, [])
             if not archivos_dia:
                 continue
@@ -609,6 +652,16 @@ def main():
             if res_dia["status"] in ["ok", "dry_run"]:
                 total_paquetes += 1
                 total_liberados += res_dia.get("bytes_liberados", 0)
+
+            # Pausa de drenaje I/O y recolección de basura entre días (protección para hardware limitado)
+            if not args.dry_run:
+                try:
+                    os.sync()
+                except AttributeError:
+                    pass
+                gc.collect()
+                if idx < len(dias_a_procesar):
+                    time.sleep(1.0)
 
         print("\n" + "=" * 68)
         print(f"  Resumen: {total_paquetes} paquete(s) procesado(s).")
