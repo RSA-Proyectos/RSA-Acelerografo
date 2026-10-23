@@ -367,6 +367,62 @@ class TestBinaryToMseed(unittest.TestCase):
         self.assertEqual(t_valid['minuto'], 15)
         self.assertEqual(t_valid['segundo'], 0)
 
+    # -------------------------------------------------------------------------
+    # T11: Purga de tramas corruptas (glitch SPI) y outliers temporales (Fase 6 / H7)
+    # -------------------------------------------------------------------------
+    def test_purga_glitch_spi_y_outlier_temporal_t11(self):
+        """T11: Verifica que tramas con bytes repetidos (0x04) o timestamps outlier
+        no causen falsos cruces de medianoche ni inflen la traza a 25 horas.
+        """
+        dat_path = os.path.join(self.temp_dir, "glitch_outlier.dat")
+
+        f0 = build_test_frame(year=2026, month=10, day=20, hour=17, minute=0, second=0, x_value=100)
+        f1 = build_test_frame(year=2026, month=10, day=20, hour=17, minute=0, second=1, x_value=101)
+        f2 = build_test_frame(year=2026, month=10, day=20, hour=17, minute=0, second=2, x_value=102)
+
+        # 1. Trama corrupta con glitch SPI (bytes idénticos 0x04)
+        f_glitch_spi = bytearray(build_test_frame(hour=17, minute=0, second=2))
+        f_glitch_spi[2500] = 4
+        f_glitch_spi[2501] = 4
+        f_glitch_spi[2502] = 4
+        f_glitch_spi[2503] = 4
+        f_glitch_spi[2504] = 4
+        f_glitch_spi[2505] = 4
+
+        # 2. Trama con timestamp outlier aislado (año 2026 válido, pero hora=4, min=4, seg=4)
+        f_outlier = bytearray(build_test_frame(year=2026, month=10, day=20, hour=4, minute=4, second=4))
+
+        f3 = build_test_frame(year=2026, month=10, day=20, hour=17, minute=0, second=3, x_value=103)
+        f4 = build_test_frame(year=2026, month=10, day=20, hour=17, minute=0, second=4, x_value=104)
+        f5 = build_test_frame(year=2026, month=10, day=20, hour=17, minute=0, second=5, x_value=105)
+
+        with open(dat_path, 'wb') as f:
+            f.write(f0)
+            f.write(f1)
+            f.write(f2)
+            f.write(f_glitch_spi)
+            f.write(f_outlier)
+            f.write(f3)
+            f.write(f4)
+            f.write(f5)
+
+        datos_np, gaps, _, _, _, t_valid = leer_archivo_binario(dat_path, self.logger)
+
+        # Ambas tramas espurias deben ser descartadas/purgadas:
+        # Quedan exactamente 6 tramas válidas (6 * 250 = 1500 muestras)
+        self.assertEqual(datos_np.shape[1], 6 * 250)
+        # No debe haber gaps falsos de medianoche ni desfases masivos
+        self.assertIsNone(gaps)
+        self.assertEqual(t_valid['hora'], 17)
+        self.assertEqual(t_valid['segundo'], 0)
+
+        # La traza final debe durar exactamente 6 segundos (1500 muestras) y no 25 horas
+        traza = obtenerTraza("HN", 1, datos_np[0], t_valid, gaps, CONFIG_MSEED_TEST)
+        self.assertEqual(traza.stats.npts, 1500)
+        self.assertEqual(len(traza.data), 1500)
+        self.assertAlmostEqual(traza.stats.endtime - traza.stats.starttime, (1500 - 1) / 250.0, places=3)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+

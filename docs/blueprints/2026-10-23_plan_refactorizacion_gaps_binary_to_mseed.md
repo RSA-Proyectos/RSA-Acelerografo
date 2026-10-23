@@ -558,6 +558,43 @@ Se cuenta con 4 archivos binarios reales extraídos de la estación `DEV0`:
 
 ---
 
+---
+
+## Fase 6: Filtrado de Outliers Temporales en Rango y Acotamiento de Medianoche (H7)
+
+**Objetivo**: Prevenir que tramas corruptas por glitches de hardware o ruido de bus SPI que posean bytes dentro del rango numérico válido (ej. `04:04:04` en `CHA2_260928-170000.dat`) sean admitidas como tramas cronológicas legítimas y disparen falsos cruces de medianoche diurnos, inflando artificialmente el archivo en 24 horas ($86,400$ segundos de ceros).
+
+### Hallazgo que resuelve
+* **H7**: Infiltración de tramas corruptas tipo bus glitch (`0x04 0x04 0x04`) que superan la máscara básica `horas <= 23 & minutos <= 59 & segundos <= 59` y disparan un falso cruce de medianoche en horario diurno, produciendo trazas de 25 horas ($22,500,000$ muestras).
+
+### Archivos a modificar
+1. `scripts/operation/mseed/binary_to_mseed.py` (`leer_archivo_binario`)
+2. `scripts/operation/mseed/test_binary_to_mseed.py` (Nuevo test T11)
+
+### Acciones de diseño e implementación
+
+#### 1. Acotamiento Estricto de la Ventana de Cruce de Medianoche
+En `leer_archivo_binario`, un salto negativo ($t_{\text{sig}} < t_{\text{ant}}$) **sólo** debe considerarse cruce de medianoche si cumple la condición limítrofe real:
+* $t_{\text{ant}} \ge 86000$ ($23:53:20$ o posterior, dentro de la hora 23).
+* $t_{\text{sig}} \le 3600$ ($01:00:00$ o anterior, dentro de la hora 00 del día siguiente).
+Si $t_{\text{sig}} < t_{\text{ant}}$ ocurre fuera de esta ventana (ej. $17:47 \to 04:04$), **NO es un cruce de medianoche**: representa una trama corrupta o desordenada.
+
+#### 2. Filtro de Coherencia Cronológica (Descarte de Outliers Temporales Aislados)
+Implementar una pasada de validación de secuencia sobre `tiempos_np` y `datos_array`:
+* Si una trama intermedia $k$ genera un salto $|t_k - t_{k-1}| > 60$ s y la trama siguiente $k+1$ retorna a la secuencia continua ($|t_{k+1} - t_{k-1}| \le 5$ s), la trama $k$ es un outlier aislado y se descarta de la lista de tiempos y datos.
+* Si una trama posee hora, minuto y segundo idénticos entre sí (`h == m == s`) y discrepa más de 60 segundos del flujo continuo circundante, se clasifica como glitch de bus SPI y se purga.
+
+#### 3. Test Unitario T11 en `test_binary_to_mseed.py`
+* **Nombre**: `test_trama_corrupta_en_rango_outlier_filtrada`
+* **Escenario**: Secuencia diurna a las 17:00:00 (seg 0 a 10) con una trama corrupta inyectada en el medio con `hora=4, minuto=4, segundo=4`.
+* **Criterio de éxito**: El conversor descarta la trama `04:04:04`, no activa el cruce de medianoche diurno, no genera 86,400 s de ceros, y produce un MiniSEED con duración exacta coherente con la hora 17.
+
+#### 4. Validación Real en DEV0 con Backlog de CHA02
+* Reprocesar `CHA2_260928-170000.dat` y verificar con ObsPy que el MiniSEED generado dure exactamente $\approx 3,599.996$ s ($900,000$ muestras).
+* Procesar los 24 archivos de CHA02 del día 2026-10-01 (`CHA2_261001-*.dat`) en `/home/rsa/data/test-bin` verificando la estabilidad total de la estación.
+
+---
+
 ## Resumen de Fases y Dependencias
 
 ```mermaid
@@ -566,7 +603,8 @@ graph TD
     F2["Fase 2: Unificar timestamp referencia H6"]
     F3["Fase 3: Medianoche + duplicados H4"]
     F4["Fase 4: Suite de tests"]
-    F5["Fase 5: Validación integración"]
+    F5["Fase 5: Validación integración reales DEV0"]
+    F6["Fase 6: Filtrado Outliers y Medianoche Estricta H7"]
 
     F1 --> F2
     F2 --> F3
@@ -574,31 +612,35 @@ graph TD
     F2 --> F4
     F3 --> F4
     F4 --> F5
+    F5 --> F6
 
     style F1 fill:#ff6666,stroke:#333,color:#000
     style F2 fill:#ffaa66,stroke:#333,color:#000
     style F3 fill:#ffaa66,stroke:#333,color:#000
     style F4 fill:#66ff66,stroke:#333,color:#000
     style F5 fill:#6699ff,stroke:#333,color:#000
+    style F6 fill:#ffcc00,stroke:#333,color:#000
 ```
 
-| Fase | Hallazgos que resuelve | Estimación |
-|---|---|---|
-| **Fase 1** | H1 (livelock), H2 (corrupción fase), H3 (inflación) | Cambio quirúrgico: ~30 líneas modificadas |
-| **Fase 2** | H6 (desacople timestamp) | ~25 líneas añadidas, 2 líneas modificadas |
-| **Fase 3** | H4a (medianoche modular y gaps), H4c (duplicados vectorizados) | ~25 líneas modificadas/añadidas |
-| **Fase 4** | H5 (suite con 11 tests unitarios sintéticos) | ~320 líneas nuevas |
-| **Fase 5** | Validación cruzada (33 tests combinados) | Sin código nuevo |
+| Fase | Hallazgos que resuelve | Estimación | Estado |
+|---|---|---|:---:|
+| **Fase 1** | H1 (livelock), H2 (corrupción fase), H3 (inflación) | ~30 líneas modificadas | ✅ Completada |
+| **Fase 2** | H6 (desacople timestamp) | ~25 líneas añadidas | ✅ Completada |
+| **Fase 3** | H4a (medianoche modular y gaps), H4c (duplicados vectorizados) | ~25 líneas modificadas | ✅ Completada |
+| **Fase 4** | H5 (suite con 11 tests unitarios sintéticos) | ~320 líneas nuevas | ✅ Completada (11/11 OK) |
+| **Fase 5** | Validación cruzada (37 tests combinados + 4 binarios reales) | Sin código nuevo | ✅ Completada |
+| **Fase 6** | H7 (tramas corruptas en rango numérico y medianoche diurna) | ~40 líneas en `leer_archivo_binario` + Test T11 | ✅ Completada (12/12 OK + CHA02 validado) |
 
 ---
 
 ## Decisiones Pendientes
 
-Ninguna. Todas las decisiones de diseño están resueltas y enmendadas:
+Ninguna. Todas las decisiones de diseño están resueltas:
 
 - **Estrategia de gaps**: Opción A (mapeo vectorizado $O(N)$ con ceros continuos). Decidido en diagnóstico, validado en auditoría.
 - **Rango temporal seguro**: `duracion_total_seg = len(data)//fsample + len(segundos_faltantes)` para evitar truncamiento post-gap.
 - **Interfaz pública**: Se mantiene intacta. `extraer_tiempo_binario` conserva nombre y firma.
-- **Retorno ampliado de `leer_archivo_binario`**: 6 valores en lugar de 5. Solo afecta a callers internos (`procesar_archivo_individual`).
+- **Retorno ampliado de `leer_archivo_binario`**: 6 valores en lugar de 5.
 - **Filtrado de duplicados**: Slicing vectorial tridimensional NumPy `(3, N_tramas, fsample)` preservando primera ocurrencia.
-- **Corrección de medianoche**: Aritmética modular con `+86400` en diferencias y recolección `(s % 86400)` para gaps inter-diarios.
+- **Corrección de medianoche**: Aritmética modular condicionada estrictamente a ventana $23 \to 00$ para evitar falsos positivos diurnos.
+- **Depuración de glitches de bus**: Purga de tramas aisladas con saltos anómalos o bytes de tiempo idénticos.

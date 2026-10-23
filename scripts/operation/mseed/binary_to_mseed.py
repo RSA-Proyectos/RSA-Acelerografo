@@ -118,9 +118,22 @@ def leer_archivo_binario(archivo_binario, logger, usar_fecha_filename=False):
             horas = chunk[:, 2503].astype(np.uint32)
             minutos = chunk[:, 2504].astype(np.uint32)
             segundos = chunk[:, 2505].astype(np.uint32)
+            anios = chunk[:, 2500].astype(np.uint32)
+            meses = chunk[:, 2501].astype(np.uint32)
+            dias = chunk[:, 2502].astype(np.uint32)
 
-            # Crear máscara de tramas con tiempos válidos
-            mascara_valida = (horas <= 23) & (minutos <= 59) & (segundos <= 59)
+            # Detectar glitch de bus con bytes idénticos (ej: 04:04:04 con anio=4, mes=4, dia=4)
+            glitch_bytes_identicos = (anios == meses) & (meses == dias) & (dias == horas) & (horas == minutos) & (minutos == segundos)
+
+            # Crear máscara de tramas con tiempos y fechas válidas
+            # anios: año de 2 dígitos (>= 20 y <= 60), o 0 para tramas de prueba/sintéticas
+            mascara_valida = (
+                (horas <= 23) & (minutos <= 59) & (segundos <= 59) &
+                (((anios >= 20) & (anios <= 60)) | (anios == 0)) &
+                (meses >= 1) & (meses <= 12) &
+                (dias >= 1) & (dias <= 31) &
+                (~glitch_bytes_identicos)
+            )
             tramas_invalidas = (~mascara_valida).sum()
 
             for h, m, s, valido in zip(horas, minutos, segundos, mascara_valida):
@@ -179,30 +192,77 @@ def leer_archivo_binario(archivo_binario, logger, usar_fecha_filename=False):
         tiempos_np = tiempos_np_raw
         datos_np = datos_array
 
+    # -------------------------------------------------------------------------
+    # Filtro de coherencia cronológica: detectar y purgar tramas espurias aisladas
+    # (glitches de hardware o paquetes desordenados)
+    # -------------------------------------------------------------------------
+    num_tramas_actual = len(tiempos_np)
+    if num_tramas_actual >= 3:
+        indices_validos = np.ones(num_tramas_actual, dtype=bool)
+
+        for i in range(1, num_tramas_actual - 1):
+            t_ant = int(tiempos_np[i - 1])
+            t_curr = int(tiempos_np[i])
+            t_sig = int(tiempos_np[i + 1])
+
+            es_med_ant = (t_ant >= 86000) and (t_curr <= 3600)
+            diff_ant = (t_curr + 86400 - t_ant) if es_med_ant else (t_curr - t_ant)
+
+            es_med_sig = (t_curr >= 86000) and (t_sig <= 3600)
+            diff_sig = (t_sig + 86400 - t_curr) if es_med_sig else (t_sig - t_curr)
+
+            es_med_global = (t_ant >= 86000) and (t_sig <= 3600)
+            diff_global = (t_sig + 86400 - t_ant) if es_med_global else (t_sig - t_ant)
+
+            # Outlier aislado: t_curr salta abruptamente (>60s o negativo fuera de medianoche)
+            # mientras que t_ant y t_sig mantienen continuidad (0 <= diff_global <= 60s)
+            salto_anomalo_in = (diff_ant < 0) or (abs(diff_ant) > 60)
+            salto_anomalo_out = (diff_sig < 0) or (abs(diff_sig) > 60)
+            continuidad_circundante = (0 <= diff_global <= 60)
+
+            if salto_anomalo_in and salto_anomalo_out and continuidad_circundante:
+                indices_validos[i] = False
+                logger.data_warning(os.path.basename(archivo_binario), "trama_outlier_purgada", f"idx={i}, t={t_curr}s ({t_curr//3600:02d}:{(t_curr%3600)//60:02d}:{t_curr%60:02d})")
+
+        num_outliers = num_tramas_actual - int(np.sum(indices_validos))
+        if num_outliers > 0:
+            tiempos_np = tiempos_np[indices_validos]
+            datos_reshaped = datos_np[:, :num_tramas_actual * fsample].reshape((3, num_tramas_actual, fsample))
+            datos_np = datos_reshaped[:, indices_validos, :].reshape((3, -1))
+
     segundos_faltantes = []
     dif_segundos = np.diff(tiempos_np)
 
-    # Corregir cruces de medianoche: si la diferencia es negativa,
-    # sumar 86400 (un día completo en segundos)
-    dif_segundos = np.where(dif_segundos < 0, dif_segundos + 86400, dif_segundos)
+    # Identificar cruces de medianoche legítimos:
+    # Solo ocurren si la trama anterior pertenece a la hora 23 y la siguiente a la hora 00
+    t_ants = tiempos_np[:-1]
+    t_sigs = tiempos_np[1:]
+    es_cruce_medianoche = (dif_segundos < 0) & (t_ants >= 86000) & (t_sigs <= 3600)
+
+    # Corregir ÚNICAMENTE cruces de medianoche legítimos
+    dif_segundos_ajustada = np.where(es_cruce_medianoche, dif_segundos + 86400, dif_segundos)
 
     # Validación de saltos anómalos
-    saltos_grandes = dif_segundos[dif_segundos > 1]
+    saltos_grandes = dif_segundos_ajustada[dif_segundos_ajustada > 1]
     if len(saltos_grandes) > 0:
         top5 = [int(x) for x in sorted(saltos_grandes)[-5:]]
         total_faltantes = sum(int(x - 1) for x in saltos_grandes)
         logger.data_warning(os.path.basename(archivo_binario), "segundos_faltantes", f"count={total_faltantes}, saltos={len(saltos_grandes)}, top5={top5}")
 
-    missing_indices = np.where(dif_segundos > 1)[0]
+    missing_indices = np.where(dif_segundos_ajustada > 1)[0]
     for idx in missing_indices:
         t_ant = int(tiempos_np[idx])
         t_sig = int(tiempos_np[idx + 1])
-        if t_sig < t_ant:
-            # Cruce de medianoche (ej. 23:59:58 -> 00:00:02): t_sig pertenece al día siguiente
+        if es_cruce_medianoche[idx]:
+            # Cruce de medianoche legítimo (23:59:xx -> 00:00:yy)
             t_sig_ajustado = t_sig + 86400
             segundos_faltantes.extend([(s % 86400) for s in range(t_ant + 1, t_sig_ajustado)])
-        else:
+        elif t_sig > t_ant:
+            # Salto positivo normal dentro del mismo día
             segundos_faltantes.extend(range(t_ant + 1, t_sig))
+        else:
+            # Salto negativo residual fuera de medianoche: registrar warning y no rellenar ceros
+            logger.data_warning(os.path.basename(archivo_binario), "salto_negativo_ignorado", f"{t_ant} -> {t_sig}")
 
     tiempo_inicio = datetime.timedelta(seconds=int(tiempos_np[0]))
     tiempo_final = datetime.timedelta(seconds=int(tiempos_np[-1]))
