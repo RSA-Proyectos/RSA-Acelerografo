@@ -149,21 +149,42 @@ def leer_archivo_binario(archivo_binario, logger, usar_fecha_filename=False):
 
                 datos[j].extend(xValue)
 
-    datos_np = np.array(datos)
-
     if total_tramas_invalidas > 0:
         logger.data_warning(os.path.basename(archivo_binario), "tramas_descartadas", total_tramas_invalidas)
 
-    tiempos_np = np.array(tiempos)
+    # Filtrar tramas con timestamps duplicados (conservar primera ocurrencia)
+    tiempos_np_raw = np.array(tiempos)
+    datos_array = np.array(datos)
+    fsample = 250  # constante de muestreo de la trama
 
     # Evitar IndexError si no hay tiempos válidos
-    if tiempos_np.size == 0:
+    if tiempos_np_raw.size == 0:
         logger.convert_fail(os.path.basename(archivo_binario), "sin_tramas_validas")
         end_time = timer()
-        return datos_np, None, end_time - start_time, None, None
+        return datos_array, None, end_time - start_time, None, None, None
+
+    _, indices_unicos = np.unique(tiempos_np_raw, return_index=True)
+    indices_unicos = np.sort(indices_unicos)  # mantener orden cronológico original
+
+    if len(indices_unicos) < len(tiempos_np_raw):
+        tramas_duplicadas = len(tiempos_np_raw) - len(indices_unicos)
+        logger.data_warning(os.path.basename(archivo_binario), "tramas_duplicadas_filtradas", tramas_duplicadas)
+        tiempos_np = tiempos_np_raw[indices_unicos]
+
+        # Vectorización multidimensional directa O(1) de overhead:
+        num_tramas_total = datos_array.shape[1] // fsample
+        datos_reshaped = datos_array[:, :num_tramas_total * fsample].reshape((3, num_tramas_total, fsample))
+        datos_np = datos_reshaped[:, indices_unicos, :].reshape((3, -1))
+    else:
+        tiempos_np = tiempos_np_raw
+        datos_np = datos_array
 
     segundos_faltantes = []
     dif_segundos = np.diff(tiempos_np)
+
+    # Corregir cruces de medianoche: si la diferencia es negativa,
+    # sumar 86400 (un día completo en segundos)
+    dif_segundos = np.where(dif_segundos < 0, dif_segundos + 86400, dif_segundos)
 
     # Validación de saltos anómalos
     saltos_grandes = dif_segundos[dif_segundos > 1]
@@ -174,7 +195,14 @@ def leer_archivo_binario(archivo_binario, logger, usar_fecha_filename=False):
 
     missing_indices = np.where(dif_segundos > 1)[0]
     for idx in missing_indices:
-        segundos_faltantes.extend(range(tiempos_np[idx] + 1, tiempos_np[idx + 1]))
+        t_ant = int(tiempos_np[idx])
+        t_sig = int(tiempos_np[idx + 1])
+        if t_sig < t_ant:
+            # Cruce de medianoche (ej. 23:59:58 -> 00:00:02): t_sig pertenece al día siguiente
+            t_sig_ajustado = t_sig + 86400
+            segundos_faltantes.extend([(s % 86400) for s in range(t_ant + 1, t_sig_ajustado)])
+        else:
+            segundos_faltantes.extend(range(t_ant + 1, t_sig))
 
     tiempo_inicio = datetime.timedelta(seconds=int(tiempos_np[0]))
     tiempo_final = datetime.timedelta(seconds=int(tiempos_np[-1]))
@@ -182,8 +210,28 @@ def leer_archivo_binario(archivo_binario, logger, usar_fecha_filename=False):
     # Extraer timestamps completos de primera y última trama
     ts_inicio, ts_final = extraer_timestamp_completo_binario(archivo_binario, usar_fecha_filename)
 
+    # Construir tiempo_binario desde la primera trama VÁLIDA (no la primera trama raw)
+    primer_tiempo_valido = int(tiempos_np[0])
+    h_val = primer_tiempo_valido // 3600
+    m_val = (primer_tiempo_valido % 3600) // 60
+    s_val = primer_tiempo_valido % 60
+
+    tiempo_binario_validado = {
+        "hora": h_val, "hora_s": str(h_val).zfill(2),
+        "minuto": m_val, "minuto_s": str(m_val).zfill(2),
+        "segundo": s_val, "segundo_s": str(s_val).zfill(2),
+        "n_segundo": primer_tiempo_valido
+    }
+    # Fecha: se toma del ts_inicio ya calculado por extraer_timestamp_completo_binario
+    if ts_inicio is not None:
+        tiempo_binario_validado.update({
+            "anio": ts_inicio.year, "anio_s": str(ts_inicio.year),
+            "mes": ts_inicio.month, "mes_s": str(ts_inicio.month).zfill(2),
+            "dia": ts_inicio.day, "dia_s": str(ts_inicio.day).zfill(2),
+        })
+
     end_time = timer()
-    return datos_np, segundos_faltantes if segundos_faltantes else None, end_time - start_time, ts_inicio, ts_final
+    return datos_np, segundos_faltantes if segundos_faltantes else None, end_time - start_time, ts_inicio, ts_final, tiempo_binario_validado
 
 
 # Extrae y convierte valores de tiempo del archivo binario y los devuelve en un diccionario.
@@ -441,21 +489,42 @@ def obtenerTraza(nombreCanal, num_canal, data, tiempo_binario, segundos_faltante
         'starttime': UTCDateTime(anio, mes, dia, horas, minutos, segundos, microsegundos)
     }
 
-    # Si hay segundos faltantes, ajustar los datos para incluir ceros en los segundos faltantes
+    # Si hay segundos faltantes, rellenar ceros con mapeo vectorizado directo O(N) por slicing
     if segundos_faltantes is not None:
         segundo_inicio = (horas * 3600) + (minutos * 60) + segundos
         muestras_por_segundo = fsample
-        lista_ceros = np.zeros(muestras_por_segundo, dtype=np.int32)
-        npts_completo = len(data) + int(len(segundos_faltantes) * muestras_por_segundo)
+
+        # 1. Calcular el rango temporal total del archivo
+        num_segundos_datos = len(data) // muestras_por_segundo
+        num_segundos_gaps = len(segundos_faltantes) if segundos_faltantes else 0
+        duracion_total_seg = num_segundos_datos + num_segundos_gaps
+        ultimo_segundo = segundo_inicio + duracion_total_seg - 1
+
+        # 2. Pre-alocar arreglo de ceros con dimensión EXACTA
+        npts_completo = duracion_total_seg * muestras_por_segundo
         data_completo = np.zeros(npts_completo, dtype=np.int32)
-        data_completo[:len(data)] = data
+
+        # 3. Construir conjunto de gaps para lookup O(1)
+        gaps_set = set(segundos_faltantes)
+
+        # 4. Copiar bloques de datos válidos en sus posiciones cronológicas exactas
+        idx_datos = 0  # cursor sobre data (datos compactados sin gaps)
+        for seg in range(segundo_inicio, ultimo_segundo + 1):
+            if seg in gaps_set:
+                # Este segundo es un gap: la posición ya tiene ceros pre-alocados
+                continue
+            # Posición destino en el arreglo completo (offset temporal desde el inicio)
+            idx_destino = (seg - segundo_inicio) * muestras_por_segundo
+            bloque = data[idx_datos : idx_datos + muestras_por_segundo]
+            if len(bloque) < muestras_por_segundo:
+                # Datos incompletos para este segundo (trama parcial al final)
+                data_completo[idx_destino : idx_destino + len(bloque)] = bloque
+                idx_datos += len(bloque)
+                break
+            data_completo[idx_destino : idx_destino + muestras_por_segundo] = bloque
+            idx_datos += muestras_por_segundo
+
         stats['npts'] = npts_completo
-
-        for segundo_faltante in segundos_faltantes:
-            tiempo_muestra_faltante = int(segundo_faltante - segundo_inicio)
-            indice_muestra_faltante = tiempo_muestra_faltante * muestras_por_segundo
-            data_completo = np.insert(data_completo, indice_muestra_faltante, lista_ceros)
-
         traza = Trace(data=data_completo, header=stats)
     else:
         traza = Trace(data=data, header=stats)
@@ -488,13 +557,17 @@ def procesar_archivo_individual(binary_file, path_archivo_salida, codigo_estacio
 
         # Generar nombre y leer datos
         nombre_archivo_mseed = nombrar_archivo_mseed(codigo_estacion, tiempo_binario)
-        datos_archivo_binario, segundos_faltantes, tiempo_lectura, ts_bin_inicio, ts_bin_final = leer_archivo_binario(binary_file, logger, usar_fecha_filename)
+        datos_archivo_binario, segundos_faltantes, tiempo_lectura, ts_bin_inicio, ts_bin_final, tiempo_binario_validado = leer_archivo_binario(binary_file, logger, usar_fecha_filename)
         
         logger.read_ok(binary_filename, tiempo_lectura)
 
+        # Usar el timestamp validado como referencia canónica para la conversión.
+        # Caer a tiempo_binario original (de extraer_tiempo_binario) solo si leer_archivo_binario no pudo validar.
+        tiempo_para_conversion = tiempo_binario_validado if tiempo_binario_validado else tiempo_binario
+
         # Realizar conversión
         ruta_mseed_completa = os.path.join(path_archivo_salida, nombre_archivo_mseed)
-        conversion_mseed_digital(nombre_archivo_mseed, path_archivo_salida, tiempo_binario, datos_archivo_binario, segundos_faltantes, config_mseed, logger)
+        conversion_mseed_digital(nombre_archivo_mseed, path_archivo_salida, tiempo_para_conversion, datos_archivo_binario, segundos_faltantes, config_mseed, logger)
         
         logger.convert_ok(binary_filename, nombre_archivo_mseed, tiempo_lectura)
         
@@ -506,7 +579,7 @@ def procesar_archivo_individual(binary_file, path_archivo_salida, codigo_estacio
             'binary_filename': binary_filename,
             'mseed_filename': nombre_archivo_mseed,
             'mseed_path': ruta_mseed_completa,
-            'tiempos_np': [int(tiempo_binario['n_segundo']), None], # El final se calcula en leer_archivo_binario si es necesario, pero aquí el usuario quiere los del array
+            'tiempos_np': [int(tiempo_para_conversion['n_segundo']), None], # Timestamp canónico validado
             'ts_bin_inicio': ts_bin_inicio,
             'ts_bin_final': ts_bin_final,
             'ts_mseed_inicio': ts_mseed_inicio,
@@ -546,6 +619,8 @@ def main():
                         help="Modo conversión manual, especifica el archivo binario (equivalente a modo 3)")
     parser.add_argument("--dir", metavar="DIRECTORIO",
                         help="Modo conversión por directorio, convierte todos los archivos .dat del directorio especificado")
+    parser.add_argument("--output-dir", "-o", metavar="DIRECTORIO",
+                        help="Directorio de salida para los archivos miniSEED generados (opcional, por defecto usa archivos_mseed)")
     args = parser.parse_args()
 
     # Obtiene la variable de entorno para definir la ruta del archivo de configuración
@@ -723,18 +798,29 @@ def main():
             binary_filename = archivo_input
             binary_file = os.path.join(path_registro_continuo, binary_filename)
 
-        if not path_archivos_mseed:
-            logger.config_error("config_dispositivo", "No se encontró la ruta 'archivos_mseed'")
-            print("Error: No se encontró la ruta 'archivos_mseed' en configuracion_dispositivo.json")
-            return
+        if args.output_dir:
+            path_archivo_salida = args.output_dir
+            if not os.path.isdir(path_archivo_salida):
+                try:
+                    os.makedirs(path_archivo_salida, exist_ok=True)
+                except Exception as e:
+                    logger.config_error("dirs", f"no_se_pudo_crear_output_dir: {e}")
+                    print(f"Error al crear el directorio de salida: {e}")
+                    return
+        else:
+            if not path_archivos_mseed:
+                logger.config_error("config_dispositivo", "No se encontró la ruta 'archivos_mseed'")
+                print("Error: No se encontró la ruta 'archivos_mseed' en configuracion_dispositivo.json")
+                return
 
-        # Verificar que el directorio de salida existe
-        if not os.path.isdir(path_archivos_mseed):
-            logger.config_error("dirs", f"mseed_dir_not_exists: {path_archivos_mseed}")
-            print(f"Error: El directorio de archivos mseed no existe: {path_archivos_mseed}")
-            return
+            # Verificar que el directorio de salida existe
+            if not os.path.isdir(path_archivos_mseed):
+                logger.config_error("dirs", f"mseed_dir_not_exists: {path_archivos_mseed}")
+                print(f"Error: El directorio de archivos mseed no existe: {path_archivos_mseed}")
+                return
 
-        path_archivo_salida = path_archivos_mseed
+            path_archivo_salida = path_archivos_mseed
+
         logger.convert_start("Manual", binary_filename)
         
     elif tipoArchivo == '4':
@@ -750,15 +836,27 @@ def main():
             print(f"Error: El directorio no existe: {directorio_entrada}")
             return
 
-        if not path_archivos_mseed:
-            logger.config_error("config_dispositivo", "No se encontró la ruta 'archivos_mseed'")
-            print("Error: No se encontró la ruta 'archivos_mseed' en configuracion_dispositivo.json")
-            return
+        if args.output_dir:
+            path_archivo_salida = args.output_dir
+            if not os.path.isdir(path_archivo_salida):
+                try:
+                    os.makedirs(path_archivo_salida, exist_ok=True)
+                except Exception as e:
+                    logger.config_error("dirs", f"no_se_pudo_crear_output_dir: {e}")
+                    print(f"Error al crear el directorio de salida: {e}")
+                    return
+        else:
+            if not path_archivos_mseed:
+                logger.config_error("config_dispositivo", "No se encontró la ruta 'archivos_mseed'")
+                print("Error: No se encontró la ruta 'archivos_mseed' en configuracion_dispositivo.json")
+                return
 
-        if not os.path.isdir(path_archivos_mseed):
-            logger.config_error("dirs", f"mseed_dir_not_exists: {path_archivos_mseed}")
-            print(f"Error: El directorio de archivos mseed no existe: {path_archivos_mseed}")
-            return
+            if not os.path.isdir(path_archivos_mseed):
+                logger.config_error("dirs", f"mseed_dir_not_exists: {path_archivos_mseed}")
+                print(f"Error: El directorio de archivos mseed no existe: {path_archivos_mseed}")
+                return
+
+            path_archivo_salida = path_archivos_mseed
 
         archivos_dat = sorted(glob.glob(os.path.join(directorio_entrada, "*.dat")))
 
@@ -770,7 +868,7 @@ def main():
         logger.convert_start("Directorio", directorio_entrada)
         logger.info(f"Archivos encontrados: {len(archivos_dat)}")
         print(f"\nEncontrados {len(archivos_dat)} archivos .dat en {directorio_entrada}")
-        print(f"Directorio de salida: {path_archivos_mseed}\n")
+        print(f"Directorio de salida: {path_archivo_salida}\n")
 
         exitosos = 0
         fallidos = 0
