@@ -100,6 +100,7 @@ def leer_archivo_binario(archivo_binario, logger, usar_fecha_filename=False):
     start_time = timer()
     datos = [[], [], []]
     tiempos = []
+    primera_trama_valida = None
 
     total_tramas_invalidas = 0
     chunk_size = 2506 * 60  # Leer en bloques de aproximadamente 2.5 MB
@@ -145,6 +146,8 @@ def leer_archivo_binario(archivo_binario, logger, usar_fecha_filename=False):
 
             # Filtrar datos crudos solo con tramas válidas
             chunk_valido = chunk[mascara_valida]
+            if primera_trama_valida is None and len(chunk_valido) > 0:
+                primera_trama_valida = chunk_valido[0].copy()
             datos_crudos = chunk_valido[:, :2500].reshape((-1, 250, 10))
 
             for j in range(3):
@@ -267,28 +270,64 @@ def leer_archivo_binario(archivo_binario, logger, usar_fecha_filename=False):
     tiempo_inicio = datetime.timedelta(seconds=int(tiempos_np[0]))
     tiempo_final = datetime.timedelta(seconds=int(tiempos_np[-1]))
 
-    # Extraer timestamps completos de primera y última trama
+    # Extraer timestamps completos de primera y última trama (aislado y tolerante a truncamiento)
     ts_inicio, ts_final = extraer_timestamp_completo_binario(archivo_binario, usar_fecha_filename)
 
-    # Construir tiempo_binario desde la primera trama VÁLIDA (no la primera trama raw)
+    # Construir tiempo_binario de forma autónoma desde la primera trama VÁLIDA
     primer_tiempo_valido = int(tiempos_np[0])
     h_val = primer_tiempo_valido // 3600
     m_val = (primer_tiempo_valido % 3600) // 60
     s_val = primer_tiempo_valido % 60
 
-    tiempo_binario_validado = {
-        "hora": h_val, "hora_s": str(h_val).zfill(2),
-        "minuto": m_val, "minuto_s": str(m_val).zfill(2),
-        "segundo": s_val, "segundo_s": str(s_val).zfill(2),
-        "n_segundo": primer_tiempo_valido
-    }
-    # Fecha: se toma del ts_inicio ya calculado por extraer_timestamp_completo_binario
-    if ts_inicio is not None:
-        tiempo_binario_validado.update({
+    # Determinación de fecha conforme al ADR-007
+    fecha_determinada = None
+    if usar_fecha_filename:
+        fecha_determinada = extraer_fecha_desde_nombre_archivo(archivo_binario)
+
+    if fecha_determinada is None and primera_trama_valida is not None:
+        # Fallback a hardware: extraer de la primera trama válida del chunk
+        anio_hw = int(primera_trama_valida[2500]) + 2000
+        mes_hw = int(primera_trama_valida[2501])
+        dia_hw = int(primera_trama_valida[2502])
+        fecha_determinada = {
+            "anio": anio_hw, "anio_s": str(anio_hw),
+            "mes": mes_hw, "mes_s": str(mes_hw).zfill(2),
+            "dia": dia_hw, "dia_s": str(dia_hw).zfill(2)
+        }
+
+    if fecha_determinada is None and ts_inicio is not None:
+        fecha_determinada = {
             "anio": ts_inicio.year, "anio_s": str(ts_inicio.year),
             "mes": ts_inicio.month, "mes_s": str(ts_inicio.month).zfill(2),
-            "dia": ts_inicio.day, "dia_s": str(ts_inicio.day).zfill(2),
-        })
+            "dia": ts_inicio.day, "dia_s": str(ts_inicio.day).zfill(2)
+        }
+
+    tiempo_binario_validado = {
+        "anio": fecha_determinada["anio"] if fecha_determinada else 2000,
+        "anio_s": fecha_determinada["anio_s"] if fecha_determinada else "2000",
+        "mes": fecha_determinada["mes"] if fecha_determinada else 1,
+        "mes_s": fecha_determinada["mes_s"] if fecha_determinada else "01",
+        "dia": fecha_determinada["dia"] if fecha_determinada else 1,
+        "dia_s": fecha_determinada["dia_s"] if fecha_determinada else "01",
+        "hora": h_val,
+        "hora_s": str(h_val).zfill(2),
+        "minuto": m_val,
+        "minuto_s": str(m_val).zfill(2),
+        "segundo": s_val,
+        "segundo_s": str(s_val).zfill(2),
+        "n_segundo": primer_tiempo_valido
+    }
+
+    # Si ts_inicio fue None debido a fallo en la primera trama física raw,
+    # pero tenemos fecha y hora comprobadas de la primera trama válida, reconstruir ts_inicio:
+    if ts_inicio is None and fecha_determinada is not None:
+        try:
+            ts_inicio = datetime.datetime(
+                fecha_determinada["anio"], fecha_determinada["mes"], fecha_determinada["dia"],
+                h_val, m_val, s_val
+            )
+        except Exception:
+            pass
 
     end_time = timer()
     return datos_np, segundos_faltantes if segundos_faltantes else None, end_time - start_time, ts_inicio, ts_final, tiempo_binario_validado
@@ -398,65 +437,67 @@ def extraer_timestamp_completo_binario(archivo_binario, usar_fecha_filename=Fals
     Returns:
         tuple: (timestamp_inicio, timestamp_final) como objetos datetime, o (None, None) si hay error
     """
+    timestamp_inicio = None
+    timestamp_final = None
+
     try:
         with open(archivo_binario, "rb") as f:
-            # Leer primera trama (2506 bytes)
+            # 1. Leer primera trama (aislado)
             primera_trama = np.fromfile(f, dtype=np.uint8, count=2506)
-            if primera_trama.size < 2506:
-                return None, None
-            
-            # HORA de la primera trama (siempre de las tramas)
-            hora_inicio = int(primera_trama[2503])
-            minuto_inicio = int(primera_trama[2504])
-            segundo_inicio = int(primera_trama[2505])
-            
-            # FECHA según configuración
-            if usar_fecha_filename:
-                fecha_info = extraer_fecha_desde_nombre_archivo(archivo_binario)
+            if primera_trama.size == 2506:
+                hora_inicio = int(primera_trama[2503])
+                minuto_inicio = int(primera_trama[2504])
+                segundo_inicio = int(primera_trama[2505])
+                
+                fecha_info = extraer_fecha_desde_nombre_archivo(archivo_binario) if usar_fecha_filename else None
                 if fecha_info:
                     anio_inicio = fecha_info['anio']
                     mes_inicio = fecha_info['mes']
                     dia_inicio = fecha_info['dia']
                 else:
-                    # Fallback a método tradicional
                     anio_inicio = int(primera_trama[2500]) + 2000
                     mes_inicio = int(primera_trama[2501])
                     dia_inicio = int(primera_trama[2502])
-            else:
-                anio_inicio = int(primera_trama[2500]) + 2000
-                mes_inicio = int(primera_trama[2501])
-                dia_inicio = int(primera_trama[2502])
-            
-            # Ir al final del archivo para leer última trama
-            f.seek(-2506, 2)  # Seek desde el final del archivo
-            ultima_trama = np.fromfile(f, dtype=np.uint8, count=2506)
-            if ultima_trama.size < 2506:
-                return None, None
-            
-            # HORA de la última trama (siempre de las tramas)
-            hora_final = int(ultima_trama[2503])
-            minuto_final = int(ultima_trama[2504])
-            segundo_final = int(ultima_trama[2505])
-            
-            # FECHA según configuración (asume que el archivo no cruza medianoche si es por filename)
-            if usar_fecha_filename:
-                anio_final = anio_inicio
-                mes_final = mes_inicio
-                dia_final = dia_inicio
-            else:
-                anio_final = int(ultima_trama[2500]) + 2000
-                mes_final = int(ultima_trama[2501])
-                dia_final = int(ultima_trama[2502])
-            
-            # Crear objetos datetime
-            timestamp_inicio = datetime.datetime(anio_inicio, mes_inicio, dia_inicio, 
-                                                hora_inicio, minuto_inicio, segundo_inicio)
-            timestamp_final = datetime.datetime(anio_final, mes_final, dia_final,
-                                               hora_final, minuto_final, segundo_final)
-            
-            return timestamp_inicio, timestamp_final
+                
+                try:
+                    timestamp_inicio = datetime.datetime(anio_inicio, mes_inicio, dia_inicio, 
+                                                        hora_inicio, minuto_inicio, segundo_inicio)
+                except Exception:
+                    timestamp_inicio = None
+
+            # 2. Leer última trama (aislado y tolerante a colas truncadas)
+            try:
+                f.seek(0, 2)
+                file_size = f.tell()
+                if file_size >= 2506:
+                    f.seek(-2506, 2)
+                    ultima_trama = np.fromfile(f, dtype=np.uint8, count=2506)
+                    if ultima_trama.size == 2506:
+                        hora_final = int(ultima_trama[2503])
+                        minuto_final = int(ultima_trama[2504])
+                        segundo_final = int(ultima_trama[2505])
+                        
+                        if usar_fecha_filename and fecha_info:
+                            anio_final = fecha_info['anio']
+                            mes_final = fecha_info['mes']
+                            dia_final = fecha_info['dia']
+                        else:
+                            anio_final = int(ultima_trama[2500]) + 2000
+                            mes_final = int(ultima_trama[2501])
+                            dia_final = int(ultima_trama[2502])
+                        
+                        try:
+                            timestamp_final = datetime.datetime(anio_final, mes_final, dia_final,
+                                                               hora_final, minuto_final, segundo_final)
+                        except Exception:
+                            timestamp_final = None
+            except Exception:
+                timestamp_final = None
+
     except Exception:
-        return None, None
+        pass
+
+    return timestamp_inicio, timestamp_final
 
 
 def extraer_timestamps_mseed(archivo_mseed):
@@ -608,22 +649,23 @@ def procesar_archivo_individual(binary_file, path_archivo_salida, codigo_estacio
     try:
         binary_filename = os.path.basename(binary_file)
         
-        # Extraer tiempo del archivo binario (con método configurable)
+        # Extraer tiempo preliminar del archivo binario
         tiempo_binario = extraer_tiempo_binario(binary_file, usar_fecha_filename)
-        if tiempo_binario is None:
-            mensaje = "Tamaño de trama insuficiente o archivo dañado"
+
+        # Leer datos y validar tramas
+        datos_archivo_binario, segundos_faltantes, tiempo_lectura, ts_bin_inicio, ts_bin_final, tiempo_binario_validado = leer_archivo_binario(binary_file, logger, usar_fecha_filename)
+
+        # Usar el timestamp validado como referencia canónica para la conversión.
+        tiempo_para_conversion = tiempo_binario_validado if tiempo_binario_validado else tiempo_binario
+        if tiempo_para_conversion is None or (datos_archivo_binario is not None and len(datos_archivo_binario[0]) == 0):
+            mensaje = "No se pudieron obtener tramas de tiempo válidas o archivo dañado"
             logger.convert_fail(binary_filename, mensaje)
             return False, mensaje, None
 
-        # Generar nombre y leer datos
-        nombre_archivo_mseed = nombrar_archivo_mseed(codigo_estacion, tiempo_binario)
-        datos_archivo_binario, segundos_faltantes, tiempo_lectura, ts_bin_inicio, ts_bin_final, tiempo_binario_validado = leer_archivo_binario(binary_file, logger, usar_fecha_filename)
-        
         logger.read_ok(binary_filename, tiempo_lectura)
 
-        # Usar el timestamp validado como referencia canónica para la conversión.
-        # Caer a tiempo_binario original (de extraer_tiempo_binario) solo si leer_archivo_binario no pudo validar.
-        tiempo_para_conversion = tiempo_binario_validado if tiempo_binario_validado else tiempo_binario
+        # Generar nombre miniSEED con el timestamp canónico validado
+        nombre_archivo_mseed = nombrar_archivo_mseed(codigo_estacion, tiempo_para_conversion)
 
         # Realizar conversión
         ruta_mseed_completa = os.path.join(path_archivo_salida, nombre_archivo_mseed)
@@ -675,9 +717,9 @@ def main():
                         help="Modo registro continuo (equivalente a modo 1)")
     parser.add_argument("--event", action="store_true",
                         help="Modo evento extraído (equivalente a modo 2)")
-    parser.add_argument("--file", metavar="ARCHIVO",
+    parser.add_argument("--file", "-f", metavar="ARCHIVO",
                         help="Modo conversión manual, especifica el archivo binario (equivalente a modo 3)")
-    parser.add_argument("--dir", metavar="DIRECTORIO",
+    parser.add_argument("--dir", "-d", metavar="DIRECTORIO",
                         help="Modo conversión por directorio, convierte todos los archivos .dat del directorio especificado")
     parser.add_argument("--output-dir", "-o", metavar="DIRECTORIO",
                         help="Directorio de salida para los archivos miniSEED generados (opcional, por defecto usa archivos_mseed)")
@@ -944,7 +986,7 @@ def main():
             
             exito, mensaje, info = procesar_archivo_individual(
                 binary_file, 
-                path_archivos_mseed, 
+                path_archivo_salida, 
                 codigo_estacion, 
                 config_mseed, 
                 logger,

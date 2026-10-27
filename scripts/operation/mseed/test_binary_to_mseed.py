@@ -17,6 +17,7 @@ import time
 import unittest
 import tempfile
 import numpy as np
+from obspy import read
 
 # Configurar path para imports en DEV0 y entorno de desarrollo
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -421,6 +422,73 @@ class TestBinaryToMseed(unittest.TestCase):
         self.assertEqual(traza.stats.npts, 1500)
         self.assertEqual(len(traza.data), 1500)
         self.assertAlmostEqual(traza.stats.endtime - traza.stats.starttime, (1500 - 1) / 250.0, places=3)
+
+    def test_archivo_truncado_por_apagon_conserva_fecha_t12(self):
+        """
+        T12: Simula un corte abrupto de energía a mitad de escritura (caso CHA2_261001-150002.dat).
+        El archivo contiene 5 tramas válidas seguidas de 1200 bytes residuales (trama cortada).
+        Verifica que leer_archivo_binario y procesar_archivo_individual extraigan la fecha y hora
+        completas de forma autónoma sin KeyError: 'anio' y generen el miniSEED correspondiente.
+        """
+        dat_path = os.path.join(self.temp_dir, "DEV00_261001-150002.dat")
+        frames = [
+            build_test_frame(year=2026, month=10, day=1, hour=15, minute=0, second=s, x_value=200 + s)
+            for s in range(5)
+        ]
+
+        # Simular 1200 bytes residuales de una trama cortada a mitad por corte de luz
+        cola_truncada = b"\x00\xFF\x55\xAA" * 300
+
+        with open(dat_path, 'wb') as f:
+            for fr in frames:
+                f.write(fr)
+            f.write(cola_truncada)
+
+        # 1. Verificar lectura y extracción autónoma de fecha
+        datos_np, gaps, _, ts_i, ts_f, t_valid = leer_archivo_binario(dat_path, self.logger)
+
+        self.assertEqual(datos_np.shape[1], 5 * 250)
+        self.assertIsNone(gaps)
+        self.assertIsNotNone(t_valid)
+        self.assertIn("anio", t_valid)
+        self.assertEqual(t_valid["anio"], 2026)
+        self.assertEqual(t_valid["mes"], 10)
+        self.assertEqual(t_valid["dia"], 1)
+        self.assertEqual(t_valid["hora"], 15)
+        self.assertEqual(t_valid["segundo"], 0)
+
+        # ts_inicio debe estar intacto a pesar de que la cola física esté rota
+        self.assertIsNotNone(ts_i)
+        self.assertEqual(ts_i.hour, 15)
+        self.assertEqual(ts_i.minute, 0)
+        self.assertEqual(ts_i.second, 0)
+
+        # 2. Verificar que obtenerTraza genera la traza sin KeyError
+        traza = obtenerTraza("HN", 1, datos_np[0], t_valid, gaps, CONFIG_MSEED_TEST)
+        self.assertEqual(traza.stats.npts, 1250)
+        self.assertEqual(traza.stats.starttime.year, 2026)
+        self.assertEqual(traza.stats.starttime.month, 10)
+        self.assertEqual(traza.stats.starttime.day, 1)
+
+        # 3. Verificar conversión completa con procesar_archivo_individual
+        out_dir = os.path.join(self.temp_dir, "output_t12")
+        os.makedirs(out_dir, exist_ok=True)
+        ok, msg, info = procesar_archivo_individual(
+            dat_path, out_dir, "DEV00", CONFIG_MSEED_TEST, self.logger, usar_fecha_filename=False
+        )
+
+        self.assertTrue(ok, f"Falló conversión de archivo truncado: {msg}")
+        self.assertIsNotNone(info)
+        self.assertTrue(os.path.exists(info["mseed_path"]))
+
+        # Verificar integridad del miniSEED generado en disco
+        st = read(info["mseed_path"])
+        self.assertEqual(len(st), 3)
+        for tr in st:
+            self.assertEqual(tr.stats.npts, 1250)
+            self.assertEqual(tr.stats.starttime.year, 2026)
+            self.assertEqual(tr.stats.starttime.month, 10)
+            self.assertEqual(tr.stats.starttime.day, 1)
 
 
 if __name__ == '__main__':

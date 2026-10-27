@@ -1,7 +1,7 @@
 ---
 proyecto: acelerografo
 tipo: diagnostico_tecnico
-resolucion: pendiente
+resolucion: resuelto
 temas: [binary_to_mseed, desacople_timestamp, corrupcion_trama, archivos_truncados, sincronizacion_sismica]
 fecha: 2026-10-26
 ---
@@ -152,7 +152,10 @@ def obtenerTraza(..., tiempo_binario, ...):
 
 ## 7. Mitigaciones Aplicadas
 
-* **Ninguna aplicada aún — en diagnóstico**: Se suspenden modificaciones en código en esta sesión para mantener la estabilidad del despliegue actual y formalizar la solución en la siguiente sesión de trabajo.
+* **Autonomía total de fecha en `leer_archivo_binario`**: Se extrae `anio`, `mes` y `dia` de forma autónoma desde el nombre del archivo (si `usar_fecha_filename=True`) o de la primera trama física válida (`chunk_valido[0]`), asegurando que `tiempo_binario_validado` siempre contenga la estructura completa requerida por `obtenerTraza`.
+* **Aislamiento en `extraer_timestamp_completo_binario`**: Se separaron las lecturas de la primera y última trama en bloques `try/except` independientes. Un truncamiento abrupto en la cola por corte de energía no invalida el timestamp de inicio ni la conversión del segmento válido.
+* **Resiliencia en `procesar_archivo_individual` y CLI**: Se eliminó el rechazo prematuro de archivos por ruido en la trama cero física y se corrigió el enrutamiento de salida en el modo `--dir`.
+* **Certificación con Test T12 y Lote Real**: Se añadió el test unitario `test_archivo_truncado_por_apagon_conserva_fecha_t12` en `test_binary_to_mseed.py` (13/13 tests OK) y se certificó el 100% de conversión exitosa (30/30 archivos) sobre el dataset `/home/rsa/data/test-bin`.
 
 ---
 
