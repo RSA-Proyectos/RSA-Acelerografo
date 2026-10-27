@@ -188,6 +188,39 @@ Al analizar [`leer_archivo_binario`](file:///home/rsa/git/montajes/acelerografo-
 
 ---
 
+### Hallazgo 7: Tramas Corruptas en Rango Válido (Glitch de Bus SPI) y Falsos Cruces de Medianoche Diurnos
+*Identificado en validación con binario real de CHA02 (`CHA2_260928-170000.dat`) el 2026-10-23*
+
+* **Descripción técnica**: Al procesar el archivo real de la estación CHA02 `CHA2_260928-170000.dat` (3,590 tramas, hora nominal 17:00), la conversión produjo un archivo MiniSEED de **25 horas continuas** ($89,999.996$ s, $22,500,000$ muestras por canal) en lugar de la hora nominal esperada ($3,599.996$ s, $900,000$ muestras).
+* **Inspección de tramas crudas**: El análisis del archivo binario reveló 6 tramas con cabeceras corruptas por ruido eléctrico o desalineación de bus SPI, caracterizadas por la repetición del mismo byte en hora, minuto y segundo:
+  - Trama 1864: `177:177:177` (`[0xB1, 0xB1, 0xB1]`) $\to$ Filtrada correctamente por `horas <= 23`.
+  - Trama 2419: `177:177:177` (`[0xB1, 0xB1, 0xB1]`) $\to$ Filtrada correctamente.
+  - Trama 2431: `144:144:144` (`[0x90, 0x90, 0x90]`) $\to$ Filtrada correctamente.
+  - Trama 2807: `240:240:240` (`[0xF0, 0xF0, 0xF0]`) $\to$ Filtrada correctamente.
+  - **Trama 2824: `04:04:04` (`[0x04, 0x04, 0x04]`) $\to$ Superó el filtro**. Al tener hora=4, minuto=4, segundo=4, cumple matemáticamente `horas <= 23 & minutos <= 59 & segundos <= 59`, por lo que fue admitida como trama válida.
+  - Trama 3047: `161:161:161` (`[0xA1, 0xA1, 0xA1]`) $\to$ Filtrada correctamente.
+* **Mecanismo de la inflación de 24 horas**:
+  1. La secuencia cronológica en el archivo fue:
+     - Trama 2823: `17:47:05` ($64,025$ segundos).
+     - **Trama 2824: `04:04:04` ($14,644$ segundos)** (Glitch de hardware).
+     - Trama 2825: `17:47:07` ($64,027$ segundos) (Retorno a datos continuos).
+  2. En el cálculo de gaps de `leer_archivo_binario`:
+     - Entre `17:47:05` y `04:04:04`, como $t_{\text{sig}} < t_{\text{ant}}$, el algoritmo asumió incondicionalmente un cruce de medianoche:
+       $$t_{\text{sig\_ajustado}} = 14,644 + 86,400 = 101,044\text{ s} \implies \text{Gap}_1 = 101,044 - 64,025 = \mathbf{37,019\text{ segundos}}$$
+     - Entre `04:04:04` y `17:47:07`, como $t_{\text{sig}} > t_{\text{ant}}$, calculó:
+       $$\text{Gap}_2 = 64,027 - 14,644 = \mathbf{49,383\text{ segundos}}$$
+     - Suma total de gaps generados por esa única trama corrupta:
+       $$\text{Total Gaps} = 37,019 + 49,383 = \mathbf{86,402\text{ segundos}}\quad (\approx 24\text{ horas})$$
+  3. Al sumar los $\approx 3,598$ segundos de datos reales más los $86,402$ segundos de ceros, la traza se infló a $90,000$ segundos ($25$ horas exactas = $22,500,000$ muestras).
+* **Causa Raíz en el Código**:
+  - **Falta de restricción contextual en el cruce de medianoche**: La adición de $+86400$ debe limitarse exclusivamente a la ventana limítrofe real: $t_{\text{ant}} \ge 86000$ (hora 23) y $t_{\text{sig}} \le 3600$ (hora 00). A las 17:00 jamás puede ocurrir un cruce de medianoche.
+  - **Ausencia de filtro de coherencia temporal / Outliers aislados**: Una trama aislada que salta abruptamente horas hacia el pasado o futuro y luego retorna a la secuencia continua debe ser descartada como paquete corrupto en lugar de asumirse como un salto temporal válido.
+* **Correlación con el problema original de CHA02**:
+  - Este hallazgo explica por qué el código anterior colapsaba en CHA02: al intentar insertar $\approx 21.6$ millones de ceros con `np.insert()` de forma iterativa, el proceso bloqueaba la CPU por horas.
+  - El nuevo algoritmo vectorizado $O(N)$ procesó los 22.5 millones de muestras y escribió el archivo MiniSEED en apenas **18.2 segundos**, demostrando la erradicación del livelock de CPU, pero evidenciando la necesidad de descartar la trama corrupta para no inflar la dimensión temporal.
+
+---
+
 ## 5. Evaluación de Riesgo
 
 | # | Escenario de Riesgo | Probabilidad | Impacto | Mitigación Requerida |
@@ -197,6 +230,7 @@ Al analizar [`leer_archivo_binario`](file:///home/rsa/git/montajes/acelerografo-
 | **R3** | **Contaminación de la red sismológica institucional**: Si un archivo con gaps se llega a convertir con el código actual, la forma de onda queda fragmentada y desfasada. Ingestar estos MiniSEED distorsiona los cálculos de aceleración pico (PGA) y detección de sismos. | Media | Crítico | Reemplazar `np.insert` por mapeo directo indexado exacto. |
 | **R4** | **Fallo por memoria agotada (OOM Killer)**: En archivos con pérdida masiva de datos (ej. más de 3,000 s faltantes), la inflación dimensional al doble de ceros combinada con buffers temporales de `np.insert` puede superar la RAM libre y ser cancelado por OOM. | Media | Alto | Pre-alocación fija y única de dimensiones exactas. |
 | **R5** | **Excepción opaca o desfase silencioso por primera trama corrupta**: Si la primera trama del binario tiene bytes de hora inválidos, `extraer_tiempo_binario` la usa sin validar mientras `leer_archivo_binario` la descarta. Esto produce un `UTCDateTime` inválido (crash) o un desacople del `segundo_inicio` de referencia (corrupción silenciosa de índices). | Baja | Alto | Unificar la fuente de timestamp de referencia con la primera trama válida filtrada por `leer_archivo_binario`. |
+| **R6** | **Inflación de 24 horas por trama corrupta en rango válido (Glitch SPI)**: Tramas corruptas con bytes idénticos (ej. `04:04:04`) pasan la validación básica y disparan un falso cruce de medianoche en horario diurno, inflando el MiniSEED en $86,400$ s de ceros espurios. | Media | Medio | Acotar la medianoche a la hora 23 y descartar outliers temporales aislados en `leer_archivo_binario`. |
 
 ---
 
@@ -286,6 +320,10 @@ Consiste en apegarse al estándar sismológico internacional (FDSN / SEED). Si e
    - Refactorizar `leer_archivo_binario` para que retorne también el timestamp de la primera trama válida.
    - Eliminar la llamada separada a `extraer_tiempo_binario` en `procesar_archivo_individual`, usando en su lugar el timestamp validado.
    - Garantizar que `obtenerTraza` y `conversion_mseed_digital` reciban siempre un `tiempo_binario` coherente con los datos filtrados.
+6. **[Filtro de Coherencia] Acotamiento Contextual de Medianoche y Filtrado de Glitches SPI en Rango** *(H7)*:
+   - Restringir la adición de `+86400` en `leer_archivo_binario` únicamente a la ventana real de medianoche ($t_{\text{ant}} \ge 86000$ en hora 23 y $t_{\text{sig}} \le 3600$ en hora 00).
+   - Implementar un filtro de coherencia cronológica en `leer_archivo_binario` que descarte tramas espurias aisladas tipo outlier (ej. caer de 17:47 a 04:04 para un solo segundo y regresar de inmediato a 17:47).
+   - Validar coherencia de campos de fecha `[anio, mes, dia]` de la trama binaria.
 
 ---
 
